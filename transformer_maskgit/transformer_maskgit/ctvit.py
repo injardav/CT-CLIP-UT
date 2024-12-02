@@ -1,3 +1,10 @@
+import os
+
+def log_intermediary_values(content):
+    logfile_path = os.path.abspath("/users/injarabi/output.log")
+    with open(logfile_path, "a") as log_file:
+        print(content, file=log_file)
+
 from pathlib import Path
 import copy
 import math
@@ -167,8 +174,8 @@ class CTViT(nn.Module):
             nn.LayerNorm(dim)
         )
 
-        self.to_patch_emb = nn.Sequential(
-            Rearrange('b c (t pt) (h p1) (w p2) -> b t h w (c pt p1 p2)', p1 = patch_height, p2 = patch_width, pt = temporal_patch_size),
+        self.to_patch_emb = nn.Sequential( # Input tensor size (1, 240, 1, 480, 480)
+            Rearrange('b c (t pt) (h p1) (w p2) -> b t h w (c pt p1 p2)', p1 = patch_height, p2 = patch_width, pt = temporal_patch_size), # New image shape should be (1, 24, 24, 24, 4000)
             nn.LayerNorm(channels * patch_width * patch_height * temporal_patch_size),
             nn.Linear(channels * patch_width * patch_height * temporal_patch_size, dim),
             nn.LayerNorm(dim)
@@ -281,29 +288,38 @@ class CTViT(nn.Module):
 
     def encode(
         self,
-        tokens
+        tokens,
+        return_attention=False
     ):
+        device=torch.device('cuda')
         b = tokens.shape[0]
         h, w = self.patch_height_width
+        attn_bias = self.spatial_rel_pos_bias(h, w, device = device)
 
         video_shape = tuple(tokens.shape[:-1])
 
+        # encode - spatial
         tokens = rearrange(tokens, 'b t h w d -> (b t) (h w) d')
-        device=torch.device('cuda')
-        attn_bias = self.spatial_rel_pos_bias(h, w, device = device)
 
-        tokens = self.enc_spatial_transformer(tokens, attn_bias = attn_bias, video_shape = video_shape)
+        if return_attention:
+            tokens, spatial_attention_weights = self.enc_spatial_transformer(tokens, attn_bias = attn_bias, video_shape = video_shape, return_attention = return_attention)
+        else:
+            tokens = self.enc_spatial_transformer(tokens, attn_bias = attn_bias, video_shape = video_shape)
 
         tokens = rearrange(tokens, '(b t) (h w) d -> b t h w d', b = b, h = h , w = w)
 
         # encode - temporal
-
         tokens = rearrange(tokens, 'b t h w d -> (b h w) t d')
 
-        tokens = self.enc_temporal_transformer(tokens, video_shape = video_shape)
+        if return_attention:
+            tokens, temporal_attention_weights = self.enc_temporal_transformer(tokens, video_shape = video_shape, return_attention = return_attention)
+        else:
+            tokens = self.enc_temporal_transformer(tokens, video_shape = video_shape)
 
         tokens = rearrange(tokens, '(b h w) t d -> b t h w d', b = b, h = h, w = w)
 
+        if return_attention:
+            return tokens, spatial_attention_weights, temporal_attention_weights
         return tokens
 
     def decode(
@@ -319,34 +335,20 @@ class CTViT(nn.Module):
         video_shape = tuple(tokens.shape[:-1])
 
         # decode - temporal
-
         tokens = rearrange(tokens, 'b t h w d -> (b h w) t d')
-
         tokens = self.dec_temporal_transformer(tokens, video_shape = video_shape)
-
         tokens = rearrange(tokens, '(b h w) t d -> b t h w d', b = b, h = h, w = w)
 
         # decode - spatial
-
         tokens = rearrange(tokens, 'b t h w d -> (b t) (h w) d')
         device=torch.device('cuda')
         attn_bias = self.spatial_rel_pos_bias(h, w, device = device)
 
         tokens = self.dec_spatial_transformer(tokens, attn_bias = attn_bias, video_shape = video_shape)
-
         tokens = rearrange(tokens, '(b t) (h w) d -> b t h w d', b = b, h = h , w = w)
 
         # to pixels
-
-        #first_frame_token, rest_frames_tokens = tokens[:, :1], tokens[:, 1:]
-
-        #first_frame = self.to_pixels_first_frame(first_frame_token)
-
-        #rest_frames = self.to_pixels(rest_frames_tokens)
-
         recon_video = self.to_pixels(tokens)
-
-        #recon_video = torch.cat((first_frame, rest_frames), dim = 2)
 
         return recon_video
 
@@ -359,56 +361,61 @@ class CTViT(nn.Module):
         return_discr_loss = False,
         apply_grad_penalty = True,
         return_only_codebook_ids = False,
-        return_encoded_tokens=False
+        return_encoded_tokens = False,
+        return_attention = False
     ):
+        log_intermediary_values(f"Input image in ViT forward requires_grad={video.requires_grad}")
         assert video.ndim in {4, 5}
 
         is_image = video.ndim == 4
-        #print(video.shape)
 
         if is_image:
-            video = rearrange(video, 'b c h w -> b c 1 h w')
+            video = rearrange(video, 'b c h w -> b c 1 h w') # New image tensor becomes (1, 240, 1, 480, 480)
+            log_intermediary_values(f"Input image in ViT after rearrange requires_grad={video.requires_grad}")
             assert not exists(mask)
 
         b, c, f, *image_dims, device = *video.shape, video.device
         device=torch.device('cuda')
+
         assert tuple(image_dims) == self.image_size
         assert not exists(mask) or mask.shape[-1] == f
 
-        first_frame, rest_frames = video[:, :, :1], video[:, :, 1:]
-
         # derive patches
-
-        #first_frame_tokens = self.to_patch_emb_first_frame(first_frame)
-        #rest_frames_tokens = self.to_patch_emb(rest_frames)
-        #tokens = torch.cat((first_frame_tokens, rest_frames_tokens), dim = 1)
         tokens = self.to_patch_emb(video)
-        # save height and width in
+        log_intermediary_values(f"Tokens in ViT after creating patch embeddings requires_grad={tokens.requires_grad}")
 
+        # save height and width in
         shape = tokens.shape
         *_, h, w, _ = shape
 
         # encode - spatial
-
-        tokens = self.encode(tokens)
+        if return_attention:
+            tokens, spatial_attention_weights, temporal_attention_weights = self.encode(tokens, return_attention)
+            log_intermediary_values(f"Tokens in ViT after encoding requires_grad={tokens.requires_grad}")
+        else:
+            tokens = self.encode(tokens)
 
         # quantize
-
         tokens, packed_fhw_shape = pack([tokens], 'b * d')
+        log_intermediary_values(f"Tokens in ViT after packing requires_grad={tokens.requires_grad}")
 
         vq_mask = None
         if exists(mask):
             vq_mask = self.calculate_video_token_mask(video, mask)
 
         tokens, indices, commit_loss = self.vq(tokens, mask = vq_mask)
+        log_intermediary_values(f"Tokens in ViT after vq requires_grad={tokens.requires_grad}")
 
         if return_only_codebook_ids:
             indices, = unpack(indices, packed_fhw_shape, 'b *')
             return indices
 
         tokens = rearrange(tokens, 'b (t h w) d -> b t h w d', h = h, w = w)
+        log_intermediary_values(f"Tokens in ViT after 2nd rearrange requires_grad={tokens.requires_grad}")
 
         if return_encoded_tokens:
+            if return_attention:
+                return tokens, spatial_attention_weights, temporal_attention_weights
             return tokens
             
         recon_video = self.decode(tokens)

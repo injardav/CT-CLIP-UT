@@ -1,3 +1,10 @@
+import os
+
+def log_intermediary_values(content):
+    logfile_path = os.path.abspath("/users/injarabi/output.log")
+    with open(logfile_path, "a") as log_file:
+        print(content, file=log_file)
+
 import math
 import copy
 from contextlib import contextmanager
@@ -255,7 +262,6 @@ class Transformer(nn.Module):
     ):
         super().__init__()
         self.checkpoint_during_training = checkpoint_during_training
-
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
@@ -619,44 +625,36 @@ class CTCLIP(nn.Module):
             return_loss = False,
             return_encodings = False,
             return_latents = False,
+            return_attention = False,       
             freeze_image_encoder = False,   # image encoder is not trained if this is set to True, proposed by LiT paper
             freeze_text_encoder = False,    # text encoder is not trained if this is set to True
             text_to_image = True,           # in the case the extra projection is turned on, would return different similarity values depending on modality directionality
             aug_text = None,                # augmented text (for multiview)
             aug_image = None                # augmented image (for multiview)
     ):
+        log_intermediary_values(f"Input image in model forward requires_grad={image.requires_grad}")
         b, device = text.input_ids.shape[0], device
 
         # derive text mask
-
-        text_mask =text.attention_mask
+        text_mask = text.attention_mask
 
         # ssl
-
         text_ssl_loss = 0
         image_ssl_loss = 0
 
         if return_loss:
-            #print("-----------")
-            #print(text.input_ids.shape)
-            #print(text.attention_mask.shape)
-            #print("------------")
             text_ssl_loss = self.mlm(text.input_ids, attention_mask = text.attention_mask) if self.use_mlm else 0
             image_ssl_loss = self.visual_ssl(image) if self.use_visual_ssl else 0
 
         # concat augmented texts and images and do some asserts
-
         num_batch_texts = num_batch_images = 1
 
         if exists(aug_text):
             aug_text = cast_tuple(aug_text)
             assert all(map(lambda t: t.shape == text.shape, aug_text))
             num_batch_texts = len(aug_text) + 1
-
             aug_text = torch.cat(aug_text, dim = 0)
-
             aug_text_mask = aug_text != self.text_pad_id
-
             text_mask = torch.cat((text_mask, aug_text_mask), dim = 0)
             text = torch.cat((text, aug_text), dim = 0)
 
@@ -664,29 +662,24 @@ class CTCLIP(nn.Module):
             aug_image = cast_tuple(aug_image)
             assert all(map(lambda i: i.shape == image.shape, aug_image))
             num_batch_images = len(aug_image) + 1
-
             aug_image = torch.cat(aug_image, dim = 0)
-
             image = torch.cat((image, aug_image), dim = 0)
 
         is_multiview = (num_batch_texts > 1 or num_batch_images > 1)
-        #assert not (return_loss and not self.training), 'loss cannot be used if not training'
         assert not (not return_loss and is_multiview), 'do not pass in augmented texts or images if not training'
         assert not (self.multiview_loss_weight == 0 and is_multiview), 'multiview loss weight cannot be 0 if augmented text or images passed in'
 
         # get encoded text
-
         text_args = (text.input_ids,text.attention_mask)
 
         if not self.text_encode_without_mask:
             text_args = (*text_args, text_mask)
 
-
-        text_embeddings = self.text_transformer(text.input_ids, attention_mask = text.attention_mask )
-        enc_text = text_embeddings[0]
+        text_embeddings = self.text_transformer(text.input_ids, attention_mask = text.attention_mask, output_attentions=True )
+        enc_text = text_embeddings.last_hidden_state
+        text_attention_weights = text_embeddings.attentions
 
         # depending on whether text is using causal mask, post process, moving eos token to the first position
-
         if self.text_causal_mask:
             eos_text_mask = (text == self.text_eos_id)
             assert torch.all(torch.any(eos_text_mask, dim = -1)), f'some of the text rows does not have the eos id {self.text_eos_id}'
@@ -704,50 +697,24 @@ class CTCLIP(nn.Module):
             rest_tokens = rearrange(rest_tokens, '(b n d) -> b n d', b = b, n = text_len - 1)
             enc_text = torch.cat((eos_tokens, rest_tokens), dim = 1)
 
-        # whether to train image encoder, in the case that the image net was pretrained as recommended in LiT
+        if return_attention:
+            enc_image, spatial_attention_weights, temporal_attention_weights = self.visual_transformer(image, return_encoded_tokens=True, return_attention=return_attention)
+        else:
+            enc_image = self.visual_transformer(image, return_encoded_tokens=True)
 
-        """enc_image = model_forward_with_context(
-            fn = self.visual_transformer,
-            args = (image,),
-            freeze = freeze_image_encoder
-        )"""
-
-        enc_image= self.visual_transformer(image, return_encoded_tokens=True)
-
-        #print("This is visual encoding")
         global h_r, w_r, z_r
         h_r, w_r, z_r = enc_image.shape[1], enc_image.shape[2], enc_image.shape[3]
 
-        #enc_image, max_indices = torch.max(enc_image, dim=1)
         enc_image_send = enc_image
 
         enc_image = torch.mean(enc_image, dim=1)
-
-        #kernel_size = (enc_image.size(1), enc_image.size(2), enc_image.size(3))
-
-        #enc_image = enc_image.permute(0,4,1,2,3)
-        # Perform max pooling over dimensions 1, 2, and 3
-        #enc_image = F.max_pool3d(enc_image, kernel_size=kernel_size)
-
-        #enc_image = enc_image.permute(0,2,3,4,1)
-
-        #print(enc_image.shape, flush=True)
-        #enc_image = enc_image[:,0,:]
-        #print(enc_image.shape, flush=True)
-        print("test all pooling")
-    
-
         enc_image = enc_image.view(enc_image.shape[0], -1)
 
-       # print(enc_image.shape, flush=True)
-
         # early return of encodings, if needed (for DALL-E2)
-
         if return_encodings:
             return enc_text, enc_image
 
         # depending on whether to do fine-grained CLIP or not, select either all tokens, or CLS tokens only
-
         if self.use_all_token_embeds:
             assert enc_text.ndim == 3, 'encoded text must have 3 dimensions (batch, seq, features)'
             assert enc_image.ndim == 3, 'encoded image must have 3 dimensions (batch, seq [height x width], features)'
@@ -758,25 +725,16 @@ class CTCLIP(nn.Module):
             image_embeds = enc_image[:, :] if enc_image.ndim == 3 else enc_image
 
         # project to latents
-        #text_embeds = text_embeds.view(text_embeds.shape[0], -1)
         text_embeds = text_embeds[:,0,:]
-
-        #text_embeds = torch.mean(text_embeds, dim=1)
         text_latents = self.to_text_latent(text_embeds)
-
+        log_intermediary_values(f"image_embeds before to_visual_latent requires_grad={image_embeds.requires_grad}")
         image_latents = self.to_visual_latent(image_embeds)
-
-
+        log_intermediary_values(f"image_latents requires_grad={image_latents.requires_grad}")
 
         text_latents, image_latents = map(l2norm, (text_latents, image_latents))
 
-
-
-
-
         # calculate another set of latents for image to text (vs text to image)
         # proposed by CLOOB
-
         text_latents_extra, image_latents_extra = text_latents, image_latents
         if self.extra_latent_projection:
             text_latents_extra = self.to_text_latent_extra(text_embeds)
@@ -784,30 +742,30 @@ class CTCLIP(nn.Module):
             text_latents_extra, image_latents_extra = map(l2norm, (text_latents_extra, image_latents_extra))
 
         # whether to early return latents
-
         if return_latents:
             if self.extra_latent_projection:
                 return text_latents, image_latents, text_latents_extra, image_latents_extra
-
             return text_latents, image_latents, enc_image_send
 
         # get temperature
-
         temp = self.temperature.exp()
 
         # early return, if needed
-
-
         if not return_loss and self.use_all_token_embeds:
             einsum_args = (text_latents_extra, image_latents_extra) if self.extra_latent_projection and not text_to_image else (text_latents, image_latents)
-            return einsum('b d, b i d -> b t i', *einsum_args) * temp
+            result = einsum('b d, b i d -> b t i', *einsum_args) * temp
+            if return_attention:
+                return result, enc_text, text_attention_weights, spatial_attention_weights, temporal_attention_weights
+            return result
 
         if not return_loss and not self.use_all_token_embeds:
             einsum_args = (text_latents_extra, image_latents_extra) if self.extra_latent_projection and not text_to_image else (text_latents, image_latents)
-            return einsum('b d, b d -> b', *einsum_args) * temp
+            result = einsum('b d, b d -> b', *einsum_args) * temp
+            if return_attention:
+                return result, enc_text, text_attention_weights, spatial_attention_weights, temporal_attention_weights
+            return result
 
         # split out multiview dimension for text and images
-
         text_latents = rearrange(text_latents, '(m b) ... -> m b ...', m = num_batch_texts)
         image_latents = rearrange(image_latents, '(m b) ... -> m b ...', m = num_batch_images)
 
@@ -848,11 +806,10 @@ class CTCLIP(nn.Module):
             if self.extra_latent_projection:
                 image_to_text = einsum('m t d, n i d -> m n i t', text_latents_extra, image_latents_extra) * temp
 
-        # calculate loss
-
+        ### calculate loss
+        
         text_to_image = rearrange(text_to_image, 'm n ... -> (m n) ...')
         image_to_text = rearrange(image_to_text, 'm n ... -> (m n) ...')
-
 
         # exponentiate
         text_to_image_exp, image_to_text_exp = map(torch.exp, (text_to_image, image_to_text))
@@ -861,7 +818,6 @@ class CTCLIP(nn.Module):
         text_to_image_pos, image_to_text_pos = map(matrix_diag, (text_to_image_exp, image_to_text_exp))
 
         # denominator
-
         if self.decoupled_contrastive_learning:
             pos_mask = torch.eye(b, device = device, dtype = torch.bool)
             text_to_image_exp, image_to_text_exp = map(lambda t: t.masked_fill(pos_mask, 0.), (text_to_image_exp, image_to_text_exp))
@@ -869,24 +825,19 @@ class CTCLIP(nn.Module):
         text_to_image_denom, image_to_text_denom = map(lambda t: t.sum(dim = -1), (text_to_image_exp, image_to_text_exp))
 
         # loss
-
         text_to_image_loss = (-log(text_to_image_pos) + log(text_to_image_denom)).mean(dim = -1)
         image_to_text_loss = (-log(image_to_text_pos) + log(image_to_text_denom)).mean(dim = -1)
 
         # calculate CL loss
-
         cl_losses = (text_to_image_loss + image_to_text_loss) / 2
 
         # get main CL loss vs multiview CL losses
-
         cl_loss, multiview_cl_loss = cl_losses[0], cl_losses[1:]
 
         # if no augmented text or images passed in, multiview loss weight is 0
-
         multiview_loss_weight = self.multiview_loss_weight if is_multiview else 0
 
         # calculate weights
-
         cl_loss_weight = 1 - (self.text_ssl_loss_weight + self.image_ssl_loss_weight + multiview_loss_weight)
 
         loss = (cl_loss * cl_loss_weight) \
@@ -894,7 +845,6 @@ class CTCLIP(nn.Module):
                + (image_ssl_loss * self.image_ssl_loss_weight)
 
         # add multiview CL loss with weight
-
         if is_multiview:
             loss = loss + multiview_cl_loss.mean() * multiview_loss_weight
 

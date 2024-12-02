@@ -1,3 +1,13 @@
+import os
+
+logfile_path = os.path.abspath("/users/injarabi/output.log")
+open(logfile_path, "w").close()  # Clears the file
+
+def log_intermediary_values(content):
+    logfile_path = os.path.abspath("/users/injarabi/output.log")
+    with open(logfile_path, "a") as log_file:
+        print(content, file=log_file)
+
 from pathlib import Path
 from shutil import rmtree
 from transformer_maskgit.optimizer import get_optimizer
@@ -12,7 +22,7 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
 
-from data_inference_nii import CTReportDatasetinfer
+from data_inference import CTReportDatasetinfer
 #from data_external_valid import CTReportDatasetinfer
 import numpy as np
 import tqdm
@@ -150,12 +160,14 @@ class CTClipInference(nn.Module):
         save_model_every = 2000,
         results_folder = './results',
         labels = "labels.csv",
+        save_weights = False,
         accelerate_kwargs: dict = dict()
     ):
         super().__init__()
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], **accelerate_kwargs)
         self.CTClip = CTClip
+        self.save_weights = save_weights
         self.tokenizer = BertTokenizer.from_pretrained('microsoft/BiomedVLP-CXR-BERT-specialized',do_lower_case=True)
         self.results_folder = results_folder
         self.register_buffer('steps', torch.Tensor([0]))
@@ -164,6 +176,12 @@ class CTClipInference(nn.Module):
         self.batch_size = batch_size
 
         all_parameters = set(CTClip.parameters())
+
+        log_intermediary_values("Logging out all parameters with gradient enabled")
+        log_intermediary_values(f"Length of parameters: {len(all_parameters)}")
+        for name, param in all_parameters:
+            log_intermediary_values(f"Parameter: {name}, requires_grad: {param.requires_grad}")
+        log_intermediary_values("Test")
 
         self.optim = get_optimizer(all_parameters, lr=lr, wd=wd)
 
@@ -209,8 +227,8 @@ class CTClipInference(nn.Module):
         self.results_folder = Path(results_folder)
 
         self.results_folder.mkdir(parents=True, exist_ok=True)
-
-
+        self.attention_maps = {}
+        self.attention_gradients = {}
 
     def save(self, path):
         if not self.accelerator.is_local_main_process:
@@ -235,6 +253,21 @@ class CTClipInference(nn.Module):
     def print(self, msg):
         self.accelerator.print(msg)
 
+    def forward_hook(self, module, input, output):
+        """Store attention map output in the dictionary."""
+        log_intermediary_values("in forward hook")
+        if module is self.CTClip.visual_transformer.enc_spatial_transformer.layers[-1][1]:
+            self.attention_maps['spatial'] = output
+        elif module is self.CTClip.visual_transformer.enc_temporal_transformer.layers[-1][1]:
+            self.attention_maps['temporal'] = output
+
+    def backward_hook(self, module, grad_in, grad_out):
+        """Store gradients in the dictionary."""
+        log_intermediary_values("in backward hook")
+        if module is self.CTClip.visual_transformer.enc_spatial_transformer.layers[-1][1]:
+            self.attention_gradients['spatial'] = grad_out[0]
+        elif module is self.CTClip.visual_transformer.enc_temporal_transformer.layers[-1][1]:
+            self.attention_gradients['temporal'] = grad_out[0]
 
     @property
     def is_main(self):
@@ -242,72 +275,112 @@ class CTClipInference(nn.Module):
 
     def train_step(self):
         device = self.device
-
         steps = int(self.steps.item())
-
-
-        # logs
         logs = {}
 
+        models_to_evaluate = ((self.CTClip, str(steps)),)
+        
+        # Pathologies for multi-label classification
+        pathologies = [
+            'Medical material','Arterial wall calcification', 'Cardiomegaly', 'Pericardial effusion',
+            'Coronary artery wall calcification', 'Hiatal hernia','Lymphadenopathy', 'Emphysema',
+            'Atelectasis', 'Lung nodule','Lung opacity', 'Pulmonary fibrotic sequela', 'Pleural effusion',
+            'Mosaic attenuation pattern','Peribronchial thickening', 'Consolidation', 'Bronchiectasis',
+            'Interlobular septal thickening'
+        ]
 
+        for model, filename in models_to_evaluate:
+            model.eval()
+            predictedall = []
+            realall = []
+            logits = []
 
-        if True:
-            with torch.no_grad():
+            text_latent_list = []
+            image_latent_list = []
+            accession_names = []
 
-                models_to_evaluate = ((self.CTClip, str(steps)),)
+            if self.save_weights:
+                spatial_attention_layer = model.visual_transformer.enc_spatial_transformer.layers[-1][1]
+                temporal_attention_layer = model.visual_transformer.enc_temporal_transformer.layers[-1][1]
 
-                for model, filename in models_to_evaluate:
-                    model.eval()
-                    predictedall=[]
-                    realall=[]
-                    logits = []
+                spatial_attention_layer.register_forward_hook(self.forward_hook)
+                spatial_attention_layer.register_full_backward_hook(self.backward_hook)
+                temporal_attention_layer.register_forward_hook(self.forward_hook)
+                temporal_attention_layer.register_full_backward_hook(self.backward_hook)
+            
+            for i in tqdm.tqdm(range(1)):  # Test with first record
+                valid_data, text, onehotlabels, acc_name = next(self.dl_iter)
+                plotdir = self.result_folder_txt
+                Path(plotdir).mkdir(parents=True, exist_ok=True)
 
-                    text_latent_list = []
-                    image_latent_list = []
-                    accession_names=[]
-                    pathologies = ['Medical material','Arterial wall calcification', 'Cardiomegaly', 'Pericardial effusion','Coronary artery wall calcification', 'Hiatal hernia','Lymphadenopathy', 'Emphysema', 'Atelectasis', 'Lung nodule','Lung opacity', 'Pulmonary fibrotic sequela', 'Pleural effusion', 'Mosaic attenuation pattern','Peribronchial thickening', 'Consolidation', 'Bronchiectasis','Interlobular septal thickening']
-                    for i in tqdm.tqdm(range(len(self.ds))):
-                        valid_data, text, onehotlabels, acc_name = next(self.dl_iter)
+                predictedlabels = []
+                onehotlabels_append = []
 
-                        plotdir = self.result_folder_txt
-                        Path(plotdir).mkdir(parents=True, exist_ok=True)
+                for pathology in pathologies:
+                    text = [f"{pathology} is present.", f"{pathology} is not present."]
+                    text_tokens = self.tokenizer(
+                        text, return_tensors="pt", padding="max_length", truncation=True, max_length=512).to(device)
+                    
+                    if self.save_weights:
+                        # Grad-CAM mode
+                        model.zero_grad()
+                        with torch.enable_grad():
+                            valid_data.requires_grad_()
+                            output, text_embeddings, text_attention_weights, spatial_attention_weights, temporal_attention_weights = model(
+                                text_tokens, valid_data.cuda(), device=device, return_attention=True
+                            )
+                        target_class_logit = output[0]
+                        target_class_logit.retain_grad()
+                        target_class_logit.backward()
+                        log_intermediary_values(f"Grad for target_class_logit: {target_class_logit.grad}")
 
-                        predictedlabels=[]
-                        onehotlabels_append=[]
+                        # Extract Grad-CAM gradients and maps
+                        spatial_weights = self.attention_gradients['spatial'].mean(dim=(2, 3))
+                        temporal_weights = self.attention_gradients['temporal'].mean(dim=(2, 4))
 
-                        for pathology in pathologies:
-                            text = [f"{pathology} is present.", f"{pathology} is not present."]
-                            text_tokens=self.tokenizer(
-                                            text, return_tensors="pt", padding="max_length", truncation=True, max_length=512).to(device)
+                        spatial_grad_cam = (spatial_weights.view(-1, 1, 1) * self.attention_maps['spatial']).sum(dim=1)
+                        temporal_grad_cam = (temporal_weights.view(-1, 1, 1) * self.attention_maps['temporal']).sum(dim=1)
+                        combined_grad_cam = (spatial_grad_cam + temporal_grad_cam) / 2
 
-                            output = model(text_tokens, valid_data.cuda(),  device=device)
+                        np.savez(
+                            f"{plotdir}attention_weights_{i}.npz",
+                            text_embeddings=text_embeddings.cpu().numpy(),
+                            text_attention_weights=[attn.cpu().numpy() for attn in text_attention_weights],
+                            spatial_self_attention_weights=[attn.cpu().numpy() for attn in spatial_attention_weights],
+                            temporal_self_attention_weights=[attn.cpu().numpy() for attn in temporal_attention_weights],
+                            combined_grad_cam=combined_grad_cam.cpu().numpy(),
+                            accession=acc_name[0]
+                        )
+                    else:
+                        # Normal inference mode
+                        with torch.no_grad():
+                            output = model(text_tokens, valid_data.cuda(), device=device)
 
-                            output = apply_softmax(output)
+                    output = apply_softmax(output)
+                    append_out = output.detach().cpu().numpy()
+                    predictedlabels.append(append_out[0])
 
-                            append_out=output.detach().cpu().numpy()
-                            predictedlabels.append(append_out[0])
+                predictedall.append(predictedlabels)
+                realall.append(onehotlabels.detach().cpu().numpy()[0])
+                accession_names.append(acc_name[0])
 
-                        predictedall.append(predictedlabels)
-                        realall.append(onehotlabels.detach().cpu().numpy()[0])
-                        accession_names.append(acc_name[0])
+            # Save predictions and real values for evaluation
+            realall = np.array(realall)
+            predictedall = np.array(predictedall)
+            
+            np.savez(f"{plotdir}labels_weights.npz", data=realall)
+            np.savez(f"{plotdir}predicted_weights.npz", data=predictedall)
+            
+            with open(f"{plotdir}accessions.txt", "w") as file:
+                for item in accession_names:
+                    file.write(item + "\n")
 
-                    realall=np.array(realall)
-                    predictedall=np.array(predictedall)
+            dfs = evaluate_internal(predictedall, realall, pathologies, plotdir)
+            
+            writer = pd.ExcelWriter(f'{plotdir}aurocs.xlsx', engine='xlsxwriter')
+            dfs.to_excel(writer, sheet_name='Sheet1', index=False)
+            writer.close()
 
-                    np.savez(f"{plotdir}labels_weights.npz", data=realall)
-                    np.savez(f"{plotdir}predicted_weights.npz", data=predictedall)
-                    with open(f"{plotdir}accessions.txt", "w") as file:
-                        for item in accession_names:
-                            file.write(item + "\n")
-
-
-                    dfs=evaluate_internal(predictedall,realall,pathologies, plotdir)
-
-                    writer = pd.ExcelWriter(f'{plotdir}aurocs.xlsx', engine='xlsxwriter')
-
-                    dfs.to_excel(writer, sheet_name='Sheet1', index=False)
-
-                    writer.close()
         self.steps += 1
         return logs
 

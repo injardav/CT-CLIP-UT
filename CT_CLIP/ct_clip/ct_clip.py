@@ -4,7 +4,7 @@ def log_intermediary_values(content):
     logfile_path = os.path.abspath("/users/injarabi/output.log")
     with open(logfile_path, "a") as log_file:
         print(content, file=log_file)
-
+        
 import math
 import copy
 from contextlib import contextmanager
@@ -600,7 +600,7 @@ class CTCLIP(nn.Module):
         path = Path(path)
         assert path.exists()
         pt = torch.load(str(path))
-        self.load_state_dict(pt)
+        self.load_state_dict(pt, strict=False)
 
     def tokenize(self, prompt):
         text_tokens=self.tokenizer(prompt, return_tensors="pt", padding="max_length", truncation=True, max_length=512).to(torch.cuda)
@@ -632,7 +632,6 @@ class CTCLIP(nn.Module):
             aug_text = None,                # augmented text (for multiview)
             aug_image = None                # augmented image (for multiview)
     ):
-        log_intermediary_values(f"Input image in model forward requires_grad={image.requires_grad}")
         b, device = text.input_ids.shape[0], device
 
         # derive text mask
@@ -727,9 +726,7 @@ class CTCLIP(nn.Module):
         # project to latents
         text_embeds = text_embeds[:,0,:]
         text_latents = self.to_text_latent(text_embeds)
-        log_intermediary_values(f"image_embeds before to_visual_latent requires_grad={image_embeds.requires_grad}")
         image_latents = self.to_visual_latent(image_embeds)
-        log_intermediary_values(f"image_latents requires_grad={image_latents.requires_grad}")
 
         text_latents, image_latents = map(l2norm, (text_latents, image_latents))
 

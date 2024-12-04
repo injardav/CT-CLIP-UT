@@ -176,13 +176,6 @@ class CTClipInference(nn.Module):
         self.batch_size = batch_size
 
         all_parameters = set(CTClip.parameters())
-
-        log_intermediary_values("Logging out all parameters with gradient enabled")
-        log_intermediary_values(f"Length of parameters: {len(all_parameters)}")
-        for name, param in all_parameters:
-            log_intermediary_values(f"Parameter: {name}, requires_grad: {param.requires_grad}")
-        log_intermediary_values("Test")
-
         self.optim = get_optimizer(all_parameters, lr=lr, wd=wd)
 
         self.max_grad_norm = max_grad_norm
@@ -191,8 +184,6 @@ class CTClipInference(nn.Module):
         self.ds = CTReportDatasetinfer(data_folder=data_folder, csv_file=reports_file,labels=labels)
 
         # Split dataset into train and validation sets
-
-
         self.dl = DataLoader(
             self.ds,
             num_workers=6,
@@ -255,15 +246,13 @@ class CTClipInference(nn.Module):
 
     def forward_hook(self, module, input, output):
         """Store attention map output in the dictionary."""
-        log_intermediary_values("in forward hook")
         if module is self.CTClip.visual_transformer.enc_spatial_transformer.layers[-1][1]:
-            self.attention_maps['spatial'] = output
+            self.attention_maps['spatial'] = output[0]
         elif module is self.CTClip.visual_transformer.enc_temporal_transformer.layers[-1][1]:
-            self.attention_maps['temporal'] = output
+            self.attention_maps['temporal'] = output[0]
 
     def backward_hook(self, module, grad_in, grad_out):
         """Store gradients in the dictionary."""
-        log_intermediary_values("in backward hook")
         if module is self.CTClip.visual_transformer.enc_spatial_transformer.layers[-1][1]:
             self.attention_gradients['spatial'] = grad_out[0]
         elif module is self.CTClip.visual_transformer.enc_temporal_transformer.layers[-1][1]:
@@ -326,29 +315,72 @@ class CTClipInference(nn.Module):
                         model.zero_grad()
                         with torch.enable_grad():
                             valid_data.requires_grad_()
+                            log_intermediary_values(f"Image shape before model forward pass: {valid_data.shape}")
                             output, text_embeddings, text_attention_weights, spatial_attention_weights, temporal_attention_weights = model(
                                 text_tokens, valid_data.cuda(), device=device, return_attention=True
                             )
                         target_class_logit = output[0]
                         target_class_logit.retain_grad()
                         target_class_logit.backward()
-                        log_intermediary_values(f"Grad for target_class_logit: {target_class_logit.grad}")
 
-                        # Extract Grad-CAM gradients and maps
-                        spatial_weights = self.attention_gradients['spatial'].mean(dim=(2, 3))
-                        temporal_weights = self.attention_gradients['temporal'].mean(dim=(2, 4))
+                        # Compute Grad-CAM maps
+                        spatial_grad_cam = self.attention_gradients['spatial'] * self.attention_maps['spatial']
+                        temporal_grad_cam = self.attention_gradients['temporal'] * self.attention_maps['temporal']
 
-                        spatial_grad_cam = (spatial_weights.view(-1, 1, 1) * self.attention_maps['spatial']).sum(dim=1)
-                        temporal_grad_cam = (temporal_weights.view(-1, 1, 1) * self.attention_maps['temporal']).sum(dim=1)
-                        combined_grad_cam = (spatial_grad_cam + temporal_grad_cam) / 2
+                        # Reshape spatial and temporal Grad-CAMs for compatibility
+                        spatial_grad_cam = rearrange(spatial_grad_cam, 't (h w) d -> 1 t h w d', h=24, w=24)
+                        temporal_grad_cam = rearrange(temporal_grad_cam, '(t h) w d -> 1 t h w d', t=24, h=24)
 
+                        # Apply mean pooling over embedding dimension
+                        spatial_grad_cam = spatial_grad_cam.mean(dim=-1)
+                        temporal_grad_cam = temporal_grad_cam.mean(dim=-1)
+
+                        # Upsample spatial and temporal Grad-CAMs to original image dimensions
+                        spatial_grad_cam_image_space = torch.nn.functional.interpolate(
+                            spatial_grad_cam.unsqueeze(1),
+                            size=valid_data.shape[-3:],
+                            mode='trilinear',
+                            align_corners=False
+                        ).squeeze(1)  # Remove channel dimension
+
+                        temporal_grad_cam_image_space = torch.nn.functional.interpolate(
+                            temporal_grad_cam.unsqueeze(1),
+                            size=valid_data.shape[-3:],
+                            mode='trilinear',
+                            align_corners=False
+                        ).squeeze(1)  # Remove channel dimension
+
+                        # Normalize Grad-CAM maps for better visualization
+                        spatial_grad_cam_image_space = (spatial_grad_cam_image_space - spatial_grad_cam_image_space.min()) / (
+                            spatial_grad_cam_image_space.max() - spatial_grad_cam_image_space.min()
+                        )
+                        temporal_grad_cam_image_space = (temporal_grad_cam_image_space - temporal_grad_cam_image_space.min()) / (
+                            temporal_grad_cam_image_space.max() - temporal_grad_cam_image_space.min()
+                        )
+
+                        # Combine Grad-CAM maps
+                        combined_grad_cam_image_space = (spatial_grad_cam_image_space + temporal_grad_cam_image_space) / 2
+                        combined_grad_cam_image_space = (combined_grad_cam_image_space - combined_grad_cam_image_space.min()) / (
+                            combined_grad_cam_image_space.max() - combined_grad_cam_image_space.min()
+                        )
+
+                        # Remove channels and batches
+                        valid_data = valid_data.squeeze(0).squeeze(0)
+                        spatial_grad_cam_image_space = spatial_grad_cam_image_space.squeeze(0)
+                        temporal_grad_cam_image_space = temporal_grad_cam_image_space.squeeze(0)
+                        combined_grad_cam_image_space = combined_grad_cam_image_space.squeeze(0)
+
+                        # Save results
                         np.savez(
                             f"{plotdir}attention_weights_{i}.npz",
-                            text_embeddings=text_embeddings.cpu().numpy(),
-                            text_attention_weights=[attn.cpu().numpy() for attn in text_attention_weights],
-                            spatial_self_attention_weights=[attn.cpu().numpy() for attn in spatial_attention_weights],
-                            temporal_self_attention_weights=[attn.cpu().numpy() for attn in temporal_attention_weights],
-                            combined_grad_cam=combined_grad_cam.cpu().numpy(),
+                            image=valid_data.detach().cpu().numpy(),
+                            text_embeddings=text_embeddings.detach().cpu().numpy(),
+                            text_attention_weights=[attn.detach().cpu().numpy() for attn in text_attention_weights],
+                            spatial_self_attention_weights=[attn.detach().cpu().numpy() for attn in spatial_attention_weights],
+                            spatial_grad_cam=spatial_grad_cam_image_space.detach().cpu().numpy(),
+                            temporal_self_attention_weights=[attn.detach().cpu().numpy() for attn in temporal_attention_weights],
+                            temporal_grad_cam=temporal_grad_cam_image_space.detach().cpu().numpy(),
+                            combined_grad_cam=combined_grad_cam_image_space.detach().cpu().numpy(),
                             accession=acc_name[0]
                         )
                     else:

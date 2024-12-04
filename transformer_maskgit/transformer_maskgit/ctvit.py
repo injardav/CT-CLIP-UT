@@ -291,32 +291,35 @@ class CTViT(nn.Module):
         tokens,
         return_attention=False
     ):
-        device=torch.device('cuda')
+        device = torch.device('cuda')
         b = tokens.shape[0]
         h, w = self.patch_height_width
-        attn_bias = self.spatial_rel_pos_bias(h, w, device = device)
-
+        attn_bias = self.spatial_rel_pos_bias(h, w, device=device)
         video_shape = tuple(tokens.shape[:-1])
 
-        # encode - spatial
+        # Encode - spatial
         tokens = rearrange(tokens, 'b t h w d -> (b t) (h w) d')
 
         if return_attention:
-            tokens, spatial_attention_weights = self.enc_spatial_transformer(tokens, attn_bias = attn_bias, video_shape = video_shape, return_attention = return_attention)
+            tokens, spatial_attention_weights = self.enc_spatial_transformer(
+                tokens, attn_bias=attn_bias, video_shape=video_shape, return_attention=return_attention
+            )
         else:
-            tokens = self.enc_spatial_transformer(tokens, attn_bias = attn_bias, video_shape = video_shape)
+            tokens = self.enc_spatial_transformer(tokens, attn_bias=attn_bias, video_shape=video_shape)
 
-        tokens = rearrange(tokens, '(b t) (h w) d -> b t h w d', b = b, h = h , w = w)
+        tokens = rearrange(tokens, '(b t) (h w) d -> b t h w d', b=b, h=h, w=w)
 
-        # encode - temporal
+        # Encode - temporal
         tokens = rearrange(tokens, 'b t h w d -> (b h w) t d')
 
         if return_attention:
-            tokens, temporal_attention_weights = self.enc_temporal_transformer(tokens, video_shape = video_shape, return_attention = return_attention)
+            tokens, temporal_attention_weights = self.enc_temporal_transformer(
+                tokens, video_shape=video_shape, return_attention=return_attention
+            )
         else:
-            tokens = self.enc_temporal_transformer(tokens, video_shape = video_shape)
+            tokens = self.enc_temporal_transformer(tokens, video_shape=video_shape)
 
-        tokens = rearrange(tokens, '(b h w) t d -> b t h w d', b = b, h = h, w = w)
+        tokens = rearrange(tokens, '(b h w) t d -> b t h w d', b=b, h=h, w=w)
 
         if return_attention:
             return tokens, spatial_attention_weights, temporal_attention_weights
@@ -355,67 +358,68 @@ class CTViT(nn.Module):
     def forward(
         self,
         video,
-        mask = None,
-        return_recons = False,
-        return_recons_only = False,
-        return_discr_loss = False,
-        apply_grad_penalty = True,
-        return_only_codebook_ids = False,
-        return_encoded_tokens = False,
-        return_attention = False
+        mask=None,
+        return_recons=False,
+        return_recons_only=False,
+        return_discr_loss=False,
+        apply_grad_penalty=True,
+        return_only_codebook_ids=False,
+        return_encoded_tokens=False,
+        return_attention=False
     ):
-        log_intermediary_values(f"Input image in ViT forward requires_grad={video.requires_grad}")
+        log_intermediary_values(f"Image shape ViT start: {video.shape}")
+        log_intermediary_values(f"Image ndim ViT start: {video.ndim}")
         assert video.ndim in {4, 5}
 
         is_image = video.ndim == 4
 
+        log_intermediary_values(f"Image shape before preprocess: {video.shape}")
+
         if is_image:
-            video = rearrange(video, 'b c h w -> b c 1 h w') # New image tensor becomes (1, 240, 1, 480, 480)
-            log_intermediary_values(f"Input image in ViT after rearrange requires_grad={video.requires_grad}")
+            video = rearrange(video, 'b c h w -> b c 1 h w')  # New shape: (b, c, 1, h, w)
             assert not exists(mask)
 
+        log_intermediary_values(f"Image shape after potential preprocess: {video.shape}")
+
         b, c, f, *image_dims, device = *video.shape, video.device
-        device=torch.device('cuda')
+        device = torch.device('cuda')
 
         assert tuple(image_dims) == self.image_size
         assert not exists(mask) or mask.shape[-1] == f
 
-        # derive patches
-        tokens = self.to_patch_emb(video)
-        log_intermediary_values(f"Tokens in ViT after creating patch embeddings requires_grad={tokens.requires_grad}")
+        log_intermediary_values(f"Shape of image before to_patch_emb: {video.shape}")
 
-        # save height and width in
+        # Derive patches
+        tokens = self.to_patch_emb(video)
+
+        # Save height and width
         shape = tokens.shape
         *_, h, w, _ = shape
 
-        # encode - spatial
+        # Encode - spatial and temporal
         if return_attention:
             tokens, spatial_attention_weights, temporal_attention_weights = self.encode(tokens, return_attention)
-            log_intermediary_values(f"Tokens in ViT after encoding requires_grad={tokens.requires_grad}")
+            return tokens, spatial_attention_weights, temporal_attention_weights
         else:
             tokens = self.encode(tokens)
 
-        # quantize
+        # Quantize tokens
         tokens, packed_fhw_shape = pack([tokens], 'b * d')
-        log_intermediary_values(f"Tokens in ViT after packing requires_grad={tokens.requires_grad}")
 
         vq_mask = None
         if exists(mask):
             vq_mask = self.calculate_video_token_mask(video, mask)
 
-        tokens, indices, commit_loss = self.vq(tokens, mask = vq_mask)
-        log_intermediary_values(f"Tokens in ViT after vq requires_grad={tokens.requires_grad}")
+        tokens, indices, commit_loss = self.vq(tokens, mask=vq_mask)
 
         if return_only_codebook_ids:
             indices, = unpack(indices, packed_fhw_shape, 'b *')
             return indices
 
-        tokens = rearrange(tokens, 'b (t h w) d -> b t h w d', h = h, w = w)
-        log_intermediary_values(f"Tokens in ViT after 2nd rearrange requires_grad={tokens.requires_grad}")
+        # Rearrange tokens back to original dimensions
+        tokens = rearrange(tokens, 'b (t h w) d -> b t h w d', h=h, w=w)
 
         if return_encoded_tokens:
-            if return_attention:
-                return tokens, spatial_attention_weights, temporal_attention_weights
             return tokens
             
         recon_video = self.decode(tokens)
@@ -434,7 +438,6 @@ class CTViT(nn.Module):
             recon_loss = F.mse_loss(video, recon_video)
 
         # prepare a random frame index to be chosen for discriminator and perceptual loss
-
         pick_frame_logits = torch.randn(b, f)
 
         if exists(mask):
@@ -444,7 +447,6 @@ class CTViT(nn.Module):
         frame_indices = pick_frame_logits.topk(1, dim = -1).indices
 
         # whether to return discriminator loss
-
         if return_discr_loss:
             assert exists(self.discr), 'discriminator must exist to train it'
 
@@ -458,11 +460,6 @@ class CTViT(nn.Module):
 
             recon_video = transform(recon_video)
             video = transform(video)
-
-            
-            #print("TEST")
-            #print(recon_video.shape)
-
 
             recon_video_discr_logits, video_discr_logits = map(self.discr, (recon_video, video))
 
@@ -478,7 +475,6 @@ class CTViT(nn.Module):
             return loss
 
         # early return if training on grayscale
-
         if not self.use_vgg_and_gan:
             if return_recons:
                 return recon_loss, returned_recon
@@ -486,7 +482,6 @@ class CTViT(nn.Module):
             return recon_loss
 
         # perceptual loss
-
         input_vgg_input = pick_video_frame(video, frame_indices)
         recon_vgg_input = pick_video_frame(recon_video, frame_indices)
         transform = T.Compose([T.Resize(256)])
@@ -494,7 +489,6 @@ class CTViT(nn.Module):
         recon_vgg_input=transform(recon_vgg_input)
         
         # handle grayscale for vgg
-        
         if video.shape[1] == 1:
             input_vgg_input2, recon_vgg_input2 = map(lambda t: repeat(t, 'b 1 ... -> b c ...', c = 3), (input_vgg_input, recon_vgg_input))
         transform = T.Compose([T.Resize(256)])
@@ -509,11 +503,9 @@ class CTViT(nn.Module):
         perceptual_loss = F.mse_loss(input_vgg_feats, recon_vgg_feats)
 
         # generator loss
-
         gen_loss = self.gen_loss(self.discr(recon_vgg_input))
 
         # calculate adaptive weight
-
         last_dec_layer = self.to_pixels[0].weight
 
         norm_grad_wrt_gen_loss = grad_layer_wrt_loss(gen_loss, last_dec_layer).norm(p = 2)
@@ -523,7 +515,6 @@ class CTViT(nn.Module):
         adaptive_weight.clamp_(max = 1e4)
 
         # combine losses
-
         loss = recon_loss + perceptual_loss + commit_loss + adaptive_weight * gen_loss
 
         if return_recons:

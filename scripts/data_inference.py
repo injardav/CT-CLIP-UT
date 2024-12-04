@@ -1,13 +1,4 @@
 import os
-
-logfile_path = os.path.abspath("/users/injarabi/output.log")
-open(logfile_path, "w").close()  # Clears the file
-
-def log_intermediary_values(content):
-    logfile_path = os.path.abspath("/users/injarabi/output.log")
-    with open(logfile_path, "a") as log_file:
-        print(content, file=log_file)
-
 import glob
 import json
 import torch
@@ -127,7 +118,7 @@ class CTReportDatasetinfer(Dataset):
 
         tensor = tensor.unsqueeze(0)
 
-        return tensor # Size (1, 240, 480, 480), padded with -1
+        return tensor # Shape (1, 240, 480, 480), padded with -1
 
     def __getitem__(self, index):
         nii_file, input_text, onehotlabels = self.samples[index]

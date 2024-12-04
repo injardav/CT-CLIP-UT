@@ -335,7 +335,7 @@ class Transformer(nn.Module):
 
             if return_attention:
                 x_out, self_attn_weights  = self_attn(x, attn_bias = attn_bias, mask = self_attn_mask, return_attention=return_attention)
-                self_attention_weights_list.append(self_attn_weights )
+                self_attention_weights_list.append(self_attn_weights)
                 x = x_out + x
             else:
                 x = self_attn(x, attn_bias = attn_bias, mask = self_attn_mask) + x

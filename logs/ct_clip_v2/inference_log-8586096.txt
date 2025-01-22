@@ -1,21 +1,0 @@
-/opt/conda/envs/conda_container_env/lib/python3.10/site-packages/huggingface_hub/file_download.py:1142: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
-  warnings.warn(
-/opt/conda/envs/conda_container_env/lib/python3.10/site-packages/huggingface_hub/file_download.py:1142: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
-  warnings.warn(
-  0%|          | 0/215 [00:00<?, ?it/s] 15%|█▍        | 32/215 [00:00<00:00, 317.84it/s] 31%|███       | 66/215 [00:00<00:00, 328.07it/s] 47%|████▋     | 101/215 [00:00<00:00, 332.92it/s] 64%|██████▍   | 138/215 [00:00<00:00, 347.16it/s] 81%|████████▏ | 175/215 [00:00<00:00, 352.31it/s] 98%|█████████▊| 211/215 [00:00<00:00, 347.41it/s]100%|██████████| 215/215 [00:00<00:00, 344.23it/s]
-/opt/conda/envs/conda_container_env/lib/python3.10/site-packages/torch/utils/data/dataloader.py:558: UserWarning: This DataLoader will create 6 worker processes in total. Our suggested max number of worker in current system is 4, which is smaller than what this DataLoader is going to create. Please be aware that excessive worker creation might get DataLoader running slow or even freeze, lower the worker number to avoid potential slowness/freeze if necessary.
-  warnings.warn(_create_warning_msg(
-Running inference...
-  0%|          | 0/1 [00:00<?, ?it/s]  0%|          | 0/1 [00:02<?, ?it/s]
-Traceback (most recent call last):
-  File "/mnt/ct_clip/CT-CLIP/scripts/run_zero_shot.py", line 62, in <module>
-    main()
-  File "/mnt/ct_clip/CT-CLIP/scripts/run_zero_shot.py", line 58, in main
-    inference.infer()
-  File "/mnt/ct_clip/CT-CLIP/scripts/zero_shot.py", line 395, in infer
-    logs = self.train_step()
-  File "/mnt/ct_clip/CT-CLIP/scripts/zero_shot.py", line 327, in train_step
-    grad_enabled_count = sum(1 for param in CTClip.parameters() if param.requires_grad)
-NameError: name 'CTClip' is not defined. Did you mean: 'CTCLIP'?
-srun: error: nid007875: task 0: Exited with exit code 1
-srun: Terminating StepId=8586096.0

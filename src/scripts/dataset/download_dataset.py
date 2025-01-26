@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 
 # Constants
-HF_TOKEN = "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"
+HF_TOKEN = ""
 SCRATCH_BASE_DIR = "/mnt/ct_clip_data"
 REPO_ID = 'ibrahimhamamci/CT-RATE'
 

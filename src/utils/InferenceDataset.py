@@ -4,7 +4,6 @@ import json
 import torch
 import pandas as pd
 import numpy as np
-from PIL import Image
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 from functools import partial
@@ -29,11 +28,7 @@ class InferenceDataset(Dataset):
         self.accession_to_text = self._load_accession_text(csv_file)
         self.paths = []
         self.samples = self._prepare_samples()
-        self.transform = transforms.Compose([
-            transforms.Resize((resize_dim, resize_dim)),
-            transforms.ToTensor()
-        ])
-        self.nii_to_tensor = partial(self._nii_img_to_tensor, transform=self.transform)
+        self.nii_to_tensor = partial(self._nii_img_to_tensor)
 
     def _load_accession_text(self, csv_file):
         """Load accession-to-text mapping from a CSV file."""
@@ -76,7 +71,7 @@ class InferenceDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _nii_img_to_tensor(self, path, transform):
+    def _nii_img_to_tensor(self, path):
         """Convert a .npz image to a tensor."""
         img_data = np.load(path)['arr_0']
         img_data = np.transpose(img_data, (1, 2, 0))
@@ -109,7 +104,7 @@ class InferenceDataset(Dataset):
 
     def __getitem__(self, index):
         nii_file, input_text, onehotlabels = self.samples[index]
-        image_tensor = self._nii_img_to_tensor(nii_file, self.transform)
+        image_tensor = self._nii_img_to_tensor(nii_file)
         input_text = input_text.replace('"', '')  
         input_text = input_text.replace('\'', '')  
         input_text = input_text.replace('(', '')  

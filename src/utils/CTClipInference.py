@@ -13,25 +13,23 @@ from src.utils.metrics import (
     plot_precision_recall_curve, plot_roc_curve
 )
 import numpy as np
-import tqdm
-import pandas as pd
+from typing import List, Dict
 import torch.optim.lr_scheduler as lr_scheduler
 
+
 # Helper Functions
-def log_intermediary_values(content, log_file_path="/users/injarabi/output.log"):
+def log_intermediary_values(content: str, log_file_path: str = "/users/injarabi/output.log") -> None:
     """Log intermediary values to a specified file."""
     with open(os.path.abspath(log_file_path), "a") as log_file:
         print(content, file=log_file)
 
-def cycle(data_loader):
+
+def cycle(data_loader: DataLoader):
     """Cycle through the data loader indefinitely."""
     while True:
         for data in data_loader:
             yield data
 
-def apply_softmax(tensor):
-    """Apply softmax to a tensor along the first dimension."""
-    return torch.nn.functional.softmax(tensor, dim=0)
 
 class CosineAnnealingWarmUpRestarts(lr_scheduler._LRScheduler):
     """Custom learning rate scheduler with warm-up and restarts."""
@@ -41,31 +39,42 @@ class CosineAnnealingWarmUpRestarts(lr_scheduler._LRScheduler):
         self.max_lr = max_lr
         self.warmup_steps = warmup_steps
         self.decay_factor = decay_factor
-        self.min_lr = 0
-        self.iteration = 0
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
-        if self.iteration < self.warmup_steps:
-            lr = self.max_lr * self.iteration / self.warmup_steps
+        iteration = self.last_epoch
+        if iteration < self.warmup_steps:
+            lr = self.max_lr * iteration / self.warmup_steps
         else:
-            current_period = self.iteration - self.warmup_steps
             period_length = self.initial_period
-            while current_period >= period_length:
-                current_period -= period_length
+            period_start = self.warmup_steps
+            while iteration >= period_start + period_length:
+                period_start += period_length
                 period_length *= self.period_multiplier
-                self.min_lr = self.max_lr * (self.decay_factor ** (self.iteration // period_length))
-            lr = self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1 + math.cos(math.pi * current_period / period_length))
-        self.iteration += 1
+            progress = (iteration - period_start) / period_length
+            lr = self.max_lr * (self.decay_factor ** (iteration // period_length))
+            lr = lr * (0.5 * (1 + math.cos(math.pi * progress)))
         return [lr for _ in self.optimizer.param_groups]
+
 
 class CTClipInference(nn.Module):
     """CTClipInference for training and evaluation of CT models."""
     def __init__(
-        self, ct_clip, *, num_train_steps, batch_size, data_folder, reports_file,
-        learning_rate=1e-4, weight_decay=0., max_grad_norm=0.5, save_results_every=100,
-        save_model_every=2000, results_folder='./results', labels_file="labels.csv",
-        accelerate_kwargs=None
+        self,
+        ct_clip: nn.Module,
+        *,
+        num_train_steps: int,
+        batch_size: int,
+        data_folder: str,
+        reports_file: str,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.,
+        max_grad_norm: float = 0.5,
+        save_results_every: int = 100,
+        save_model_every: int = 2000,
+        results_folder: str = './results',
+        labels_file: str = "labels.csv",
+        accelerate_kwargs: Dict = None
     ):
         super().__init__()
         accelerate_kwargs = accelerate_kwargs or {}
@@ -77,19 +86,18 @@ class CTClipInference(nn.Module):
         # Initialize paths and results directory
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(parents=True, exist_ok=True)
-        self.register_buffer('steps', torch.Tensor([0]))
 
-        # Training parameters
+        # Parameters
+        self.steps = 0
         self.num_train_steps = num_train_steps
         self.batch_size = batch_size
         self.max_grad_norm = max_grad_norm
         self.learning_rate = learning_rate
 
         # Optimizer and dataset
-        all_parameters = set(ct_clip.parameters())
-        self.optimizer = get_optimizer(all_parameters, lr=learning_rate, wd=weight_decay)
+        self.optimizer = get_optimizer(set(ct_clip.parameters()), lr=learning_rate, wd=weight_decay)
         self.dataset = InferenceDataset(data_folder=data_folder, csv_file=reports_file, labels=labels_file)
-        self.data_loader = DataLoader(self.dataset, num_workers=6, batch_size=1, shuffle=True)
+        self.data_loader = DataLoader(self.dataset, num_workers=6, batch_size=batch_size, shuffle=True)
         self.data_loader_iter = cycle(self.data_loader)
 
         # Device and scheduler
@@ -116,7 +124,7 @@ class CTClipInference(nn.Module):
         self.save_model_every = save_model_every
         self.save_results_every = save_results_every
 
-    def save(self, path):
+    def save(self, path: str) -> None:
         """Save model and optimizer state."""
         if not self.accelerator.is_local_main_process:
             return
@@ -124,10 +132,10 @@ class CTClipInference(nn.Module):
             {
                 'model': self.accelerator.get_state_dict(self.ct_clip),
                 'optimizer': self.optimizer.state_dict()
-            }, path
+            }, Path(path)
         )
 
-    def load(self, path):
+    def load(self, path: str) -> None:
         """Load model and optimizer state from a file."""
         path = Path(path)
         assert path.exists(), "Checkpoint not found."
@@ -135,72 +143,53 @@ class CTClipInference(nn.Module):
         self.accelerator.unwrap_model(self.ct_clip).load_state_dict(package['model'])
         self.optimizer.load_state_dict(package['optimizer'])
 
-    def train_step(self):
-        """Perform one training step."""
-        device = self.device
-        steps = int(self.steps.item())
-
-        results_path = self.results_folder / f"CTClip_{self.steps}"
-        results_path.mkdir(parents=True, exist_ok=True)
-
-        pathologies = [
-            'Medical material', 'Arterial wall calcification', 'Cardiomegaly',
-            'Pericardial effusion', 'Coronary artery wall calcification', 'Hiatal hernia',
-            'Lymphadenopathy', 'Emphysema', 'Atelectasis', 'Lung nodule', 'Lung opacity',
-            'Pulmonary fibrotic sequela', 'Pleural effusion', 'Mosaic attenuation pattern',
-            'Peribronchial thickening', 'Consolidation', 'Bronchiectasis', 'Interlobular septal thickening'
-        ]
-
-        self.ct_clip.eval()
+    def _process_batch(self, pathologies: List[str]):
+        """Process a single batch and log results."""
         predicted_all, real_all, accession_names = [], [], []
+        valid_data, _, onehot_labels, acc_name = next(self.data_loader_iter)
+        for pathology in pathologies:
+            log_intermediary_values(f"Processing {pathology}")
+            text_tokens = self.tokenizer(
+                [f"{pathology} is present.", f"{pathology} is not present."],
+                return_tensors="pt", padding="max_length", truncation=True, max_length=512
+            ).to(self.device)
 
-        for _ in tqdm.tqdm(range(1)):
-            valid_data, text, onehot_labels, acc_name = next(self.data_loader_iter)
+            with torch.no_grad():
+                output, _ = self.ct_clip(text_tokens, valid_data.cuda(), device=self.device)
+                output = torch.nn.functional.softmax(output, dim=0)
 
-            sim_score_attention = []
-            for pathology in pathologies:
-                log_intermediary_values(f"Evaluating pathology: {pathology}")
-                text_tokens = self.tokenizer(
-                    [f"{pathology} is present.", f"{pathology} is not present."],
-                    return_tensors="pt", padding="max_length", truncation=True, max_length=512
-                ).to(device)
+            predicted_all.append(output.cpu().numpy()[0])
+            real_all.append(onehot_labels.cpu().numpy()[0])
+            accession_names.append(acc_name[0])
 
-                with torch.no_grad():
-                    output, spatial_scores = self.ct_clip(text_tokens, valid_data.cuda(), device=device)
-                    sim_score_attention.append(spatial_scores.cpu().numpy())
+        return np.array(predicted_all), np.array(real_all)
 
-                output = apply_softmax(output)
-                predicted_all.append(output.cpu().numpy()[0])
-                real_all.append(onehot_labels.cpu().numpy()[0])
-                accession_names.append(acc_name[0])
+    def infer_step(self) -> None:
+        """Perform one inference step."""
+        pathologies = [
+            'Medical material', 'Arterial wall calcification', 'Cardiomegaly', 'Pericardial effusion',
+            'Coronary artery wall calcification', 'Hiatal hernia', 'Lymphadenopathy', 'Emphysema',
+            'Atelectasis', 'Lung nodule', 'Lung opacity', 'Pulmonary fibrotic sequela', 'Pleural effusion',
+            'Mosaic attenuation pattern', 'Peribronchial thickening', 'Consolidation', 'Bronchiectasis',
+            'Interlobular septal thickening'
+        ]
+        predicted_all, real_all = self._process_batch(pathologies)
 
-        predicted_all = np.array(predicted_all)
-        real_all = np.array(real_all)
-
-        # Calculate and save metrics
+        # Calculate metrics and save results
         metrics = calculate_metrics(predicted_all, real_all, pathologies)
-        save_metrics(metrics, pathologies, results_path)
-
-        # Generate and save plots
-        plot_precision_recall_curve(real_all, predicted_all, pathologies, results_path)
-        plot_roc_curve(real_all, predicted_all, pathologies, results_path)
-        plot_per_class_f1(metrics, pathologies, results_path)
+        save_metrics(metrics, pathologies, self.results_folder)
+        plot_precision_recall_curve(real_all, predicted_all, pathologies, self.results_folder)
+        plot_roc_curve(real_all, predicted_all, pathologies, self.results_folder)
+        plot_per_class_f1(metrics, pathologies, self.results_folder)
 
         self.steps += 1
-        return {}
 
-    def infer(self, log_fn=lambda x: None):
+    def infer(self) -> None:
         """Run inference until the specified number of steps."""
         while self.steps < self.num_train_steps:
-            logs = self.train_step()
-            log_fn(logs)
+            self.infer_step()
         self.print("Inference complete")
 
-    def print(self, message):
+    def print(self, message: str) -> None:
         """Print a message using the accelerator."""
         self.accelerator.print(message)
-
-    @property
-    def is_main(self):
-        """Check if the current process is the main process."""
-        return self.accelerator.is_main_process

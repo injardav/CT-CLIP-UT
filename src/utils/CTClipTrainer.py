@@ -133,6 +133,9 @@ class CTClipTrainer(nn.Module):
 
         rmtree(str(self.results_folder))
 
+        print(f"Training size: {len(self.ds)}")
+        print(f"Validation size: {len(self.valid_ds)}")
+
     def save_model(self, path):
         if self.accelerator.is_local_main_process:
             pkg = {

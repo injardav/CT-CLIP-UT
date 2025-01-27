@@ -17,4 +17,4 @@ CONTAINER=/projappl/project_465001111/ct_clip/ct_clip.sif
 srun singularity exec -B $HOME_DIR:/mnt/ct_clip_home \
                       -B $SCRATCH_DIR:/mnt/ct_clip_data \
                       -B $PROJECT_DIR:/mnt/ct_clip \
-                      $CONTAINER python /mnt/ct_clip/CT-CLIP-UT/scripts/run_train.py
+                      $CONTAINER python /mnt/ct_clip/CT-CLIP-UT/src/train.py

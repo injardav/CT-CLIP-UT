@@ -40,8 +40,8 @@ inference = CTClipInference(
     data_folder = '/mnt/ct_clip_data/valid_preprocessed',
     reports_file= "/mnt/ct_clip_data/reports/valid_reports.csv",
     labels = "/mnt/ct_clip_data/labels/valid_labels.csv",
-    batch_size = 1,
     results_folder="/mnt/ct_clip_data/inference_zeroshot/",
+    batch_size = 1,
     num_train_steps = 1
 )
 

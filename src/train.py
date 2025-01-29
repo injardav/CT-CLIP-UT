@@ -1,8 +1,9 @@
 from monai.networks.nets.swin_unetr import SwinTransformer
 from monai.utils import ensure_tuple_rep
-from src import CTCLIP
-from src.utils import CTClipTrainer
+from CTCLIP import CTCLIP
+from utils.CTClipTrainer import CTClipTrainer
 from transformers import BertModel
+from torch import nn
 
 
 text_encoder = BertModel.from_pretrained("microsoft/BiomedVLP-CXR-BERT-specialized")
@@ -35,15 +36,15 @@ clip = CTCLIP(
 )
 trainer = CTClipTrainer(
     clip,
-    reports_file_train= "/mnt/ct_clip_data/reports/train_reports.csv",
-    reports_file_valid= "/mnt/ct_clip_data/reports/valid_reports.csv",
+    train_reports= "/mnt/ct_clip_data/reports/train_reports.csv",
+    valid_reports= "/mnt/ct_clip_data/reports/valid_reports.csv",
     data_train= "/mnt/ct_clip_data/data_volumes/dataset/train",
     data_valid = "/mnt/ct_clip_data/valid_preprocessed",
-    labels = "/mnt/ct_clip_data/labels/valid_labels.csv",
+    valid_labels = "/mnt/ct_clip_data/labels/valid_labels.csv",
     train_metadata = "/mnt/ct_clip_data/metadata/train_metadata.csv",
-    batch_size = 4,
+    batch_size = 1,
     results_folder="/mnt/ct_clip_data/train_zeroshot/",
-    num_train_steps = 1001,
+    num_train_steps = 10001,
     num_workers = 4,
 )
 

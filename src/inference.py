@@ -1,7 +1,7 @@
 from monai.networks.nets.swin_unetr import SwinTransformer
 from monai.utils import ensure_tuple_rep
-from src import CTCLIP
-from src.utils import CTClipInference
+from CTCLIP import CTCLIP
+from utils.CTClipInference import CTClipInference
 from transformers import BertModel
 
 

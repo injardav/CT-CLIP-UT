@@ -11,28 +11,25 @@ import torch.nn.functional as F
 import tqdm
 
 class InferenceDataset(Dataset):
-    def __init__(self, data_folder, csv_file, min_slices=20, resize_dim=500, labels="labels.csv"):
+    def __init__(self, data_folder, reports, labels, num_samples=500):
         """
         Dataset for processing CT scans and associated inference data.
 
         Args:
             data_folder (str): Path to the folder containing CT data.
-            csv_file (str): Path to the CSV file containing report metadata.
-            min_slices (int, optional): Minimum number of slices for inclusion. Defaults to 20.
-            resize_dim (int, optional): Dimension to resize images. Defaults to 500.
-            labels (str, optional): Path to the labels CSV file. Defaults to "labels.csv".
+            reports (str): Path to the CSV file containing report metadata.
+            labels (str): Path to the labels CSV file.
         """
         self.data_folder = data_folder
-        self.min_slices = min_slices
         self.labels = labels
-        self.accession_to_text = self._load_accession_text(csv_file)
+        self.accession_to_text = self._load_accession_text(reports)
         self.paths = []
-        self.samples = self._prepare_samples()
+        self.samples = self._prepare_samples()[:num_samples]
         self.nii_to_tensor = partial(self._nii_img_to_tensor)
 
-    def _load_accession_text(self, csv_file):
+    def _load_accession_text(self, reports):
         """Load accession-to-text mapping from a CSV file."""
-        df = pd.read_csv(csv_file)
+        df = pd.read_csv(reports)
         return {
             row['VolumeName']: (row['Findings_EN'] or "", row['Impressions_EN'] or "")
             for _, row in df.iterrows()

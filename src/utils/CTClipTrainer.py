@@ -7,50 +7,20 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from transformers import BertTokenizer
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs
-from accelerate.state import DistributedDataParallelKwargs
+from accelerate.utils import DistributedDataParallelKwargs
 
-from src.utils.TrainDataset import TrainDataset
-from src.utils.InferenceDataset import InferenceDataset
-from src.utils.metrics import calculate_metrics, save_metrics, plot_per_class_f1, plot_precision_recall_curve, plot_roc_curve
-from src import CTCLIP
-from src.utils.optimizer import get_optimizer
+from utils.TrainDataset import TrainDataset
+from utils.InferenceDataset import InferenceDataset
+from utils.metrics import calculate_metrics, save_metrics, plot_per_class_f1, plot_precision_recall_curve, plot_roc_curve
+from CTCLIP import CTCLIP
+from utils.optimizer import get_optimizer
 
-# Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-def apply_softmax(array):
-    """
-    Applies softmax function to a tensor.
-
-    Args:
-        array (torch.Tensor): Input tensor.
-
-    Returns:
-        torch.Tensor: Tensor after applying softmax.
-    """
-    return torch.nn.functional.softmax(array, dim=0)
-
-def tensor_to_nifti(tensor, path, affine=np.eye(4)):
-    """
-    Save a tensor as a NIfTI file.
-
-    Args:
-        tensor (torch.Tensor): Input tensor with shape (D, H, W) or (C, D, H, W).
-        path (str): Path to save the NIfTI file.
-        affine (np.ndarray): Affine matrix for the NIfTI file.
-    """
-    from nibabel import Nifti1Image, save
-
-    tensor = tensor.cpu()
-    if tensor.dim() == 4:
-        tensor = tensor.squeeze(0)  # Save the first channel if multi-channel
-    numpy_data = tensor.permute(2, 1, 0).detach().numpy().astype(np.float32)  # Adjust for NIfTI axes
-    nifti_img = Nifti1Image(numpy_data, affine)
-    save(nifti_img, path)
 
 def create_cyclic_dataloader(dataloader):
     """Creates a cyclic iterator for a DataLoader."""
@@ -69,9 +39,9 @@ class CTClipTrainer(nn.Module):
         batch_size: int,
         data_train: str,
         data_valid: str,
-        reports_file_train: str,
-        reports_file_valid: str,
-        labels: str,
+        train_reports: str,
+        valid_reports: str,
+        valid_labels: str,
         train_metadata: str,
         tokenizer: BertTokenizer = None,
         lr: float = 1.25e-6,
@@ -80,17 +50,20 @@ class CTClipTrainer(nn.Module):
         save_results_every: int = 1000,
         save_model_every: int = 1000,
         results_folder: str = './results',
-        num_workers: int = 8,
-        accelerate_kwargs: dict = None
+        num_workers: int = 8
     ):
         super().__init__()
         self.accelerator = Accelerator(
             kwargs_handlers=[
                 DistributedDataParallelKwargs(find_unused_parameters=True),
-                InitProcessGroupKwargs(timeout=timedelta(seconds=36000))
+                InitProcessGroupKwargs(timeout=timedelta(seconds=36000), backend="nccl")
             ],
-            **(accelerate_kwargs or {})
+            mixed_precision="fp16",
+            device_placement=True
         )
+
+        log_level = logging.INFO if Accelerator().is_main_process else logging.ERROR
+        logging.basicConfig(level=log_level, format="%(asctime)s - %(message)s")
 
         self.CTClip = CTClip
         self.tokenizer = tokenizer or BertTokenizer.from_pretrained(
@@ -103,24 +76,38 @@ class CTClipTrainer(nn.Module):
         self.batch_size = batch_size
         self.max_grad_norm = max_grad_norm
 
-        self.ds = TrainDataset(data_folder=data_train, csv_file=reports_file_train, train_metadata=train_metadata)
-        self.valid_ds = InferenceDataset(data_folder=data_valid, csv_file=reports_file_valid, labels=labels)
+        self.train_ds = TrainDataset(data_folder=data_train, reports=train_reports, metadata=train_metadata)
+        self.valid_ds = InferenceDataset(data_folder=data_valid, reports=valid_reports, labels=valid_labels)
 
-        self.dl = DataLoader(self.ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-        self.valid_dl = DataLoader(self.valid_ds, batch_size=1, shuffle=False, num_workers=num_workers)
+        self.train_sampler = DistributedSampler(
+            self.train_ds,
+            num_replicas=self.accelerator.num_processes,  # Total GPUs
+            rank=self.accelerator.process_index,  # Unique index of this GPU
+            shuffle=True
+        )
 
-        self.dl_iter = create_cyclic_dataloader(self.dl)
+        self.valid_sampler = DistributedSampler(
+            self.valid_ds,
+            num_replicas=self.accelerator.num_processes,
+            rank=self.accelerator.process_index,
+            shuffle=False  # Don't shuffle validation data
+        )
+
+        self.train_dl = DataLoader(self.train_ds, batch_size=batch_size, sampler=self.train_sampler, num_workers=num_workers)
+        self.valid_dl = DataLoader(self.valid_ds, batch_size=1, sampler=self.valid_sampler, num_workers=num_workers)
+
+        self.train_dl_iter = create_cyclic_dataloader(self.train_dl)
         self.valid_dl_iter = create_cyclic_dataloader(self.valid_dl)
 
         self.optim = get_optimizer(CTClip.parameters(), lr=lr, wd=wd)
 
         (
-            self.dl_iter,
+            self.train_dl_iter,
             self.valid_dl_iter,
             self.CTClip,
             self.optim,
         ) = self.accelerator.prepare(
-            self.dl_iter,
+            self.train_dl_iter,
             self.valid_dl_iter,
             self.CTClip,
             self.optim,
@@ -129,12 +116,15 @@ class CTClipTrainer(nn.Module):
         self.save_results_every = save_results_every
         self.save_model_every = save_model_every
         self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(parents=True, exist_ok=True)
+        self.best_model_path = self.results_folder / "best_model"
+        self.best_score = float("inf")
 
-        rmtree(str(self.results_folder))
+        if self.accelerator.process_index == 0:
+            self.results_folder.mkdir(parents=True, exist_ok=True)
+            self.best_model_path.mkdir(parents=True, exist_ok=True)
 
-        print(f"Training size: {len(self.ds)}")
-        print(f"Validation size: {len(self.valid_ds)}")
+            print(f"Training size: {len(self.train_ds)}")
+            print(f"Validation size: {len(self.valid_ds)}")
 
     def save_model(self, path):
         if self.accelerator.is_local_main_process:
@@ -156,7 +146,7 @@ class CTClipTrainer(nn.Module):
         self.CTClip.train()
         logs = {}
 
-        image, text = next(self.dl_iter)
+        image, text = next(self.train_dl_iter)
         image = image.to(self.accelerator.device)
         text_tokens = self.tokenizer(
             text,
@@ -177,12 +167,14 @@ class CTClipTrainer(nn.Module):
         self.optim.zero_grad()
 
         logs['loss'] = loss.item()
-        logger.info(f"Step {self.steps}: Loss = {logs['loss']}")
+
+        if self.accelerator.is_main_process:
+            logger.info(f"Step {self.steps}: Loss = {logs['loss']}")
 
         if self.steps % self.save_results_every == 0:
             self.evaluate_and_save()
 
-        if self.steps % self.save_model_every == 0:
+        if self.steps % self.save_model_every == 0 and self.accelerator.is_main_process:
             model_path = self.results_folder / f'CTClip.{self.steps}.pt'
             self.save_model(model_path)
             logger.info(f"Model saved at {model_path}")
@@ -222,22 +214,38 @@ class CTClipTrainer(nn.Module):
                     max_length=512
                 ).to(self.accelerator.device)
 
-                output = self.CTClip(text_tokens, image, return_loss=False)
-                output = apply_softmax(output)
-                predicted_labels.append(float(output[0].item() > output[1].item()))
+                output, _ = self.CTClip(text_tokens, image, return_loss=False)
+                output = torch.nn.functional.softmax(output, dim=0)
+                predicted_class = (output[:, 0] > output[:, 1]).long()  # Compare probabilities
+                predicted_labels.extend(predicted_class.tolist())
 
             predicted_all.append(predicted_labels)
             real_all.append(labels.cpu().numpy())
 
-        predicted_all = np.array(predicted_all)
-        real_all = np.array(real_all)
+        # Gather predictions and labels from all ranks
+        predicted_all = self.accelerator.gather_for_metrics(predicted_all)
+        real_all = self.accelerator.gather_for_metrics(real_all)
+        
+        if self.accelerator.is_main_process:
+            predicted_all = np.array(predicted_all)
+            real_all = np.array(real_all).squeeze(axis=1)
 
-        metrics = calculate_metrics(predicted_all, real_all, pathologies)
-        save_metrics(metrics, pathologies, results_path)
+            metrics = calculate_metrics(predicted_all, real_all, pathologies)
+            save_metrics(metrics, pathologies, results_path)
 
-        plot_precision_recall_curve(real_all, predicted_all, pathologies, results_path)
-        plot_roc_curve(real_all, predicted_all, pathologies, results_path)
-        plot_per_class_f1(metrics, pathologies, results_path)
+            plot_precision_recall_curve(real_all, predicted_all, pathologies, results_path)
+            plot_roc_curve(real_all, predicted_all, pathologies, results_path)
+            plot_per_class_f1(metrics, pathologies, results_path)
+
+            # Compute mean ROC AUC for evaluation
+            macro_f1 = np.mean(metrics['macro_f1'])
+
+            # Save best model based on ROC AUC
+            if macro_f1 > self.best_score:  # Replace with `macro_f1` if preferred
+                self.best_score = macro_f1
+                best_model_path = self.best_model_path / f"best_checkpoint_{self.steps}.pt"
+                self.save_model(best_model_path)
+                logger.info(f"New best model saved at step {self.steps} with macro_f1 = {macro_f1:.4f}")
 
     def train(self):
         while self.steps < self.num_train_steps:

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import nibabel as nib
 import tqdm
 
+
 def resize_array(array, current_spacing, target_spacing):
     """
     Resize the input 3D array to match the target spacing.
@@ -32,35 +33,27 @@ def resize_array(array, current_spacing, target_spacing):
     return resized_array
 
 class TrainDataset(Dataset):
-    def __init__(self, data_folder, csv_file, train_metadata, min_slices=20, resize_dim=500, num_samples=1000):
+    def __init__(self, data_folder, reports, metadata, num_samples=5000):
         """
         Dataset for processing CT scans and associated text data.
 
         Args:
             data_folder (str): Path to the folder containing CT data.
-            csv_file (str): Path to the CSV file containing report metadata.
-            train_metadata (str): Path to the metadata CSV file.
-            min_slices (int, optional): Minimum number of slices for inclusion. Defaults to 20.
-            resize_dim (int, optional): Dimension to resize images. Defaults to 500.
-            num_samples (int, optional): Number of samples to limit the dataset. Defaults to 1000.
+            reports (str): Path to the report CSV file.
+            metadata (str): Path to the metadata CSV file.
+            num_samples (int, optional): Number of samples to limit the dataset. Defaults to 5000.
         """
         self.data_folder = data_folder
-        self.min_slices = min_slices
-        self.resize_dim = resize_dim
-        self.train_metadata = train_metadata
-        self.accession_to_text = self._load_accession_text(csv_file)
+        self.metadata = metadata
+        self.accession_to_text = self._load_accession_text(reports)
         self.samples = self._prepare_samples()[:num_samples]
-        self.transform = transforms.Compose([
-            transforms.Resize((resize_dim, resize_dim)),
-            transforms.ToTensor()
-        ])
-        self.nii_to_tensor = partial(self._nii_img_to_tensor, transform=self.transform)
+        self.nii_to_tensor = partial(self._nii_img_to_tensor)
 
-    def _load_accession_text(self, csv_file):
+    def _load_accession_text(self, reports):
         """Load accession-to-text mapping from a CSV file."""
-        df = pd.read_csv(csv_file)
+        df = pd.read_csv(reports)
         return {
-            row['VolumeName']: (row['Findings_EN'] or "", row['Impressions_EN'] or "")
+            row['VolumeName']: (str(row['Findings_EN']) or "", str(row['Impressions_EN']) or "")
             for _, row in df.iterrows()
         }
 
@@ -80,7 +73,7 @@ class TrainDataset(Dataset):
 
     def _load_nii_metadata(self, path):
         """Load metadata from the training metadata CSV for a given file."""
-        df = pd.read_csv(self.train_metadata)
+        df = pd.read_csv(self.metadata)
         row = df[df['VolumeName'] == os.path.basename(path)]
         if row.empty:
             raise ValueError(f"Metadata not found for {path}")
@@ -92,7 +85,7 @@ class TrainDataset(Dataset):
             "z_spacing": float(row["ZSpacing"].iloc[0])
         }
 
-    def _nii_img_to_tensor(self, path, transform):
+    def _nii_img_to_tensor(self, path):
         """Convert a NIfTI image to a tensor."""
         nii_img = nib.load(str(path))
         img_data = nii_img.get_fdata()

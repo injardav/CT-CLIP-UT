@@ -2,17 +2,20 @@ from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, roc_curve, precision_recall_curve
 )
 import matplotlib.pyplot as plt
+import numpy as np
+
 
 def calculate_metrics(predicted_all, real_all, pathologies):
     """Calculate evaluation metrics for the model."""
     metrics = {}
     metrics['flat_accuracy'] = accuracy_score(real_all.flatten(), predicted_all.flatten())
-    metrics['per_class_f1'] = f1_score(real_all, predicted_all, average=None)
-    metrics['macro_f1'] = f1_score(real_all, predicted_all, average='macro')
-    metrics['per_class_precision'] = precision_score(real_all, predicted_all, average=None)
-    metrics['per_class_recall'] = recall_score(real_all, predicted_all, average=None)
+    metrics['per_class_f1'] = f1_score(real_all, predicted_all, average=None, zero_division=0)
+    metrics['macro_f1'] = f1_score(real_all, predicted_all, average='macro', zero_division=0)
+    metrics['per_class_precision'] = precision_score(real_all, predicted_all, average=None, zero_division=0)
+    metrics['per_class_recall'] = recall_score(real_all, predicted_all, average=None, zero_division=0)
     metrics['roc_aucs'] = [
-        roc_auc_score(real_all[:, i], predicted_all[:, i]) for i in range(len(pathologies))
+        roc_auc_score(real_all[:, i], predicted_all[:, i]) if len(set(real_all[:, i])) > 1 else np.nan
+        for i in range(len(pathologies))
     ]
     return metrics
 

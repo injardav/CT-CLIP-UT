@@ -25,13 +25,13 @@ def matrix_diag(t):
 
 
 class CTCLIP(nn.Module):
-    def __init__(self, *, text_transformer, image_transformer, dim_text, dim_image, dim_latent, temperature_init=1.0):
+    def __init__(self, *, text_encoder, image_encoder, dim_text, dim_image, dim_latent, temperature_init=1.0):
         """
         CTCLIP: Contrastive Text and Image Pretraining Model.
 
         Args:
-            text_transformer (nn.Module): Pre-initialized text transformer module.
-            image_transformer (nn.Module): Pre-initialized image transformer module.
+            text_encoder (nn.Module): Pre-initialized text transformer module.
+            image_encoder (nn.Module): Pre-initialized image transformer module.
             dim_text (int): Dimensionality of text embeddings.
             dim_image (int): Dimensionality of image embeddings.
             dim_latent (int): Dimensionality of the contrastive latent space.
@@ -40,8 +40,8 @@ class CTCLIP(nn.Module):
         super().__init__()
 
         # Encoders
-        self.text_transformer = text_transformer
-        self.image_transformer = image_transformer
+        self.text_encoder = text_encoder
+        self.image_encoder = image_encoder
 
         # Projection layers
         self.to_text_latent = nn.Linear(dim_text, dim_latent, bias=False)
@@ -79,8 +79,8 @@ class CTCLIP(nn.Module):
         Forward pass for CTCLIP.
         """
         # Encode text and images
-        text_encodings = self.text_transformer(**text_inputs).last_hidden_state
-        image_encodings = self.image_transformer(image_inputs)[-1]
+        text_encodings = self.text_encoder(**text_inputs).last_hidden_state
+        image_encodings = self.image_encoder(image_inputs)[-1]
 
         # Flatten and rearrange images
         image_encodings = image_encodings.flatten(2)        # Flatten spatial dimensions (depth, height, width -> depth*height*width)
@@ -99,8 +99,8 @@ class CTCLIP(nn.Module):
         # Return loss if required
         if return_loss:
             # Compute logits for text-to-image and image-to-text
-            text_to_image = torch.einsum('b t d, b i d -> b t i', text_latents, image_latents) * temp
-            image_to_text = torch.einsum('b i d, b t d -> b t i', image_latents, text_latents) * temp
+            text_to_image = torch.einsum('b d, b i d -> b i', text_latents, image_latents) * temp
+            image_to_text = torch.einsum('b i d, b d -> b i', image_latents, text_latents) * temp
 
             # Exponentiate
             text_to_image_exp, image_to_text_exp = map(torch.exp, (text_to_image, image_to_text))

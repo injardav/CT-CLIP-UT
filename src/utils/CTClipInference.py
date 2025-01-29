@@ -6,9 +6,9 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from transformers import BertTokenizer
-from src.utils import InferenceDataset
-from src.utils.optimizer import get_optimizer
-from src.utils.metrics import (
+from utils.InferenceDataset import InferenceDataset
+from utils.optimizer import get_optimizer
+from utils.metrics import (
     calculate_metrics, save_metrics, plot_per_class_f1,
     plot_precision_recall_curve, plot_roc_curve
 )

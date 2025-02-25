@@ -62,7 +62,6 @@ class CTClipInference(nn.Module):
     def __init__(
         self,
         ct_clip: nn.Module,
-        *,
         num_train_steps: int,
         batch_size: int,
         data_folder: str,
@@ -71,7 +70,6 @@ class CTClipInference(nn.Module):
         weight_decay: float = 0.,
         max_grad_norm: float = 0.5,
         save_results_every: int = 100,
-        save_model_every: int = 2000,
         results_folder: str = './results',
         labels_file: str = "labels.csv",
         accelerate_kwargs: Dict = None
@@ -96,7 +94,7 @@ class CTClipInference(nn.Module):
 
         # Optimizer and dataset
         self.optimizer = get_optimizer(set(ct_clip.parameters()), lr=learning_rate, wd=weight_decay)
-        self.dataset = InferenceDataset(data_folder=data_folder, csv_file=reports_file, labels=labels_file)
+        self.dataset = InferenceDataset(data_folder, reports_file, labels_file)
         self.data_loader = DataLoader(self.dataset, num_workers=6, batch_size=batch_size, shuffle=True)
         self.data_loader_iter = cycle(self.data_loader)
 
@@ -121,7 +119,6 @@ class CTClipInference(nn.Module):
         )
 
         # Save intervals
-        self.save_model_every = save_model_every
         self.save_results_every = save_results_every
 
     def save(self, path: str) -> None:
@@ -145,8 +142,8 @@ class CTClipInference(nn.Module):
 
     def _process_batch(self, pathologies: List[str]):
         """Process a single batch and log results."""
-        predicted_all, real_all, accession_names = [], [], []
-        valid_data, _, onehot_labels, acc_name = next(self.data_loader_iter)
+        predicted_all, real_all = [], []
+        image, _, labels, acc_name = next(self.data_loader_iter)
         for pathology in pathologies:
             log_intermediary_values(f"Processing {pathology}")
             text_tokens = self.tokenizer(
@@ -155,12 +152,11 @@ class CTClipInference(nn.Module):
             ).to(self.device)
 
             with torch.no_grad():
-                output, _ = self.ct_clip(text_tokens, valid_data.cuda(), device=self.device)
+                output, _ = self.ct_clip(text_tokens, image.cuda())
                 output = torch.nn.functional.softmax(output, dim=0)
 
             predicted_all.append(output.cpu().numpy()[0])
-            real_all.append(onehot_labels.cpu().numpy()[0])
-            accession_names.append(acc_name[0])
+            real_all.append(labels.cpu().numpy()[0])
 
         return np.array(predicted_all), np.array(real_all)
 

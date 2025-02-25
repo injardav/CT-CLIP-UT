@@ -3,6 +3,7 @@ from monai.utils import ensure_tuple_rep
 from CTCLIP import CTCLIP
 from utils.CTClipInference import CTClipInference
 from transformers import BertModel
+from torch import nn
 
 
 text_encoder = BertModel.from_pretrained("microsoft/BiomedVLP-CXR-BERT-specialized")
@@ -39,7 +40,7 @@ inference = CTClipInference(
     clip,
     data_folder = '/mnt/ct_clip_data/valid_preprocessed',
     reports_file= "/mnt/ct_clip_data/reports/valid_reports.csv",
-    labels = "/mnt/ct_clip_data/labels/valid_labels.csv",
+    labels_file = "/mnt/ct_clip_data/labels/valid_labels.csv",
     results_folder="/mnt/ct_clip_data/inference_zeroshot/",
     batch_size = 1,
     num_train_steps = 1

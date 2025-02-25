@@ -1,10 +1,12 @@
-from pathlib import Path
-from shutil import rmtree
-from datetime import timedelta
 import logging
-
 import numpy as np
 import torch
+import itertools
+
+from pathlib import Path
+from shutil import rmtree
+from datetime import timedelta, datetime
+
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -15,17 +17,21 @@ from accelerate.utils import DistributedDataParallelKwargs
 
 from utils.TrainDataset import TrainDataset
 from utils.InferenceDataset import InferenceDataset
-from utils.metrics import calculate_metrics, save_metrics, plot_per_class_f1, plot_precision_recall_curve, plot_roc_curve
+from utils.metrics import *
 from CTCLIP import CTCLIP
 from utils.optimizer import get_optimizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-def create_cyclic_dataloader(dataloader):
-    """Creates a cyclic iterator for a DataLoader."""
-    while True:
-        yield from dataloader
+PATHOLOGIES = [
+            "Medical material", "Arterial wall calcification", "Cardiomegaly",
+            "Pericardial effusion", "Coronary artery wall calcification", "Hiatal hernia",
+            "Lymphadenopathy", "Emphysema", "Atelectasis", "Lung nodule",
+            "Lung opacity", "Pulmonary fibrotic sequela", "Pleural effusion",
+            "Mosaic attenuation pattern", "Peribronchial thickening", "Consolidation",
+            "Bronchiectasis", "Interlobular septal thickening"
+        ]
 
 class CTClipTrainer(nn.Module):
     """
@@ -34,8 +40,7 @@ class CTClipTrainer(nn.Module):
 
     def __init__(
         self,
-        CTClip: CTCLIP,
-        num_train_steps: int,
+        model: CTCLIP,
         batch_size: int,
         data_train: str,
         data_valid: str,
@@ -44,13 +49,16 @@ class CTClipTrainer(nn.Module):
         valid_labels: str,
         train_metadata: str,
         tokenizer: BertTokenizer = None,
-        lr: float = 1.25e-6,
+        lr: float = 1.25e-5,
         wd: float = 0.0,
         max_grad_norm: float = 0.5,
-        save_results_every: int = 1000,
-        save_model_every: int = 1000,
-        results_folder: str = './results',
-        num_workers: int = 8
+        results_folder: str = "./results",
+        num_workers: int = 8,
+        num_epochs: int = 10,
+        num_save_split: int = 5,
+        num_train_samples: int = 100,
+        num_valid_samples: int = 20,
+        save_best_model: bool = False
     ):
         super().__init__()
         self.accelerator = Accelerator(
@@ -62,192 +70,272 @@ class CTClipTrainer(nn.Module):
             device_placement=True
         )
 
-        log_level = logging.INFO if Accelerator().is_main_process else logging.ERROR
+        log_level = logging.INFO if self.accelerator.is_main_process else logging.ERROR
         logging.basicConfig(level=log_level, format="%(asctime)s - %(message)s")
+        self.maybe_print = print if self.accelerator.is_main_process else lambda *args, **kwargs: None
 
-        self.CTClip = CTClip
+        self.model = model
+        self.model.accelerator = self.accelerator
         self.tokenizer = tokenizer or BertTokenizer.from_pretrained(
-            'microsoft/BiomedVLP-CXR-BERT-specialized',
+            "microsoft/BiomedVLP-CXR-BERT-specialized",
             do_lower_case=True
         )
 
-        self.steps = 0
-        self.num_train_steps = num_train_steps
+        self.num_epochs = num_epochs
+        self.num_save_split = num_save_split
         self.batch_size = batch_size
         self.max_grad_norm = max_grad_norm
+        self.save_best_model = save_best_model
 
-        self.train_ds = TrainDataset(data_folder=data_train, reports=train_reports, metadata=train_metadata)
-        self.valid_ds = InferenceDataset(data_folder=data_valid, reports=valid_reports, labels=valid_labels)
+        self.train_ds = TrainDataset(data_folder=data_train, reports=train_reports, metadata=train_metadata, num_samples=num_train_samples)
+        self.valid_ds = InferenceDataset(data_folder=data_valid, reports=valid_reports, labels=valid_labels, num_samples=num_valid_samples)
 
         self.train_sampler = DistributedSampler(
             self.train_ds,
-            num_replicas=self.accelerator.num_processes,  # Total GPUs
-            rank=self.accelerator.process_index,  # Unique index of this GPU
-            shuffle=True
+            num_replicas=self.accelerator.num_processes,
+            rank=self.accelerator.process_index,
+            shuffle=True,
+            drop_last=True
         )
 
         self.valid_sampler = DistributedSampler(
             self.valid_ds,
             num_replicas=self.accelerator.num_processes,
             rank=self.accelerator.process_index,
-            shuffle=False  # Don't shuffle validation data
+            shuffle=False,
+            drop_last=True
         )
 
         self.train_dl = DataLoader(self.train_ds, batch_size=batch_size, sampler=self.train_sampler, num_workers=num_workers)
-        self.valid_dl = DataLoader(self.valid_ds, batch_size=1, sampler=self.valid_sampler, num_workers=num_workers)
+        self.valid_dl = DataLoader(self.valid_ds, batch_size=batch_size, sampler=self.valid_sampler, num_workers=num_workers)
 
-        self.train_dl_iter = create_cyclic_dataloader(self.train_dl)
-        self.valid_dl_iter = create_cyclic_dataloader(self.valid_dl)
-
-        self.optim = get_optimizer(CTClip.parameters(), lr=lr, wd=wd)
+        self.optim = get_optimizer(model.parameters(), lr=lr, wd=wd)
 
         (
-            self.train_dl_iter,
-            self.valid_dl_iter,
-            self.CTClip,
+            self.model,
             self.optim,
         ) = self.accelerator.prepare(
-            self.train_dl_iter,
-            self.valid_dl_iter,
-            self.CTClip,
+            self.model,
             self.optim,
         )
 
-        self.save_results_every = save_results_every
-        self.save_model_every = save_model_every
-        self.results_folder = Path(results_folder)
-        self.best_model_path = self.results_folder / "best_model"
-        self.best_score = float("inf")
+        self.metrics = []
+        self.train_losses = {}
+        self.valid_losses = []
+        self.valid_accuracies = []
+        self.best_score = 0
 
         if self.accelerator.process_index == 0:
+            # Create correct results directory structure dynamically
+            self.results_folder = Path(results_folder) / datetime.now().strftime("%d-%m-%Y")
             self.results_folder.mkdir(parents=True, exist_ok=True)
-            self.best_model_path.mkdir(parents=True, exist_ok=True)
 
-            print(f"Training size: {len(self.train_ds)}")
-            print(f"Validation size: {len(self.valid_ds)}")
+            existing_folders = [d for d in self.results_folder.iterdir() if d.is_dir()]
+            idx = len(existing_folders) + 1
 
-    def save_model(self, path):
-        if self.accelerator.is_local_main_process:
+            self.results_folder = self.results_folder / str(idx)
+            self.results_folder.mkdir(parents=True, exist_ok=True)
+
+            self.maybe_print(f"Training size: {len(self.train_dl.dataset)}")
+            self.maybe_print(f"Validation size: {len(self.valid_dl.dataset)}")
+
+    def save_model(self, name, log=None):
+        if self.accelerator.is_main_process:
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
             pkg = {
-                'model': self.accelerator.get_state_dict(self.CTClip),
-                'optim': self.optim.state_dict()
+                "model": self.accelerator.get_state_dict(unwrapped_model),
+                "optim": self.optim.state_dict()
             }
-            torch.save(pkg, path)
+            torch.save(pkg, self.results_folder / name)
+            with open(self.results_folder / "architecture.txt", "w") as f:
+                f.write(str(unwrapped_model))
 
     def load_model(self, path):
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found at {path}")
         pkg = torch.load(path)
-        self.CTClip.load_state_dict(pkg['model'])
-        self.optim.load_state_dict(pkg['optim'])
+        self.model.load_state_dict(pkg["model"])
+        self.optim.load_state_dict(pkg["optim"])
+        self.model = self.model.to(self.accelerator.device)
 
-    def train_step(self):
-        self.CTClip.train()
-        logs = {}
+    def train_step(self, batch):
+        self.model.train()
 
-        image, text = next(self.train_dl_iter)
-        image = image.to(self.accelerator.device)
+        images, texts = batch
+        images = images.to(self.accelerator.device)
         text_tokens = self.tokenizer(
-            text,
+            texts,
             return_tensors="pt",
             padding="max_length",
             truncation=True,
             max_length=512
         ).to(self.accelerator.device)
 
-        with self.accelerator.autocast():
-            loss = self.CTClip(text_tokens, image, return_loss=True)
+        with self.accelerator.accumulate(self.model):
+            loss, _ = self.model(text_tokens, images)
+            self.accelerator.backward(loss)
 
-        self.accelerator.backward(loss)
-        if self.max_grad_norm:
-            self.accelerator.clip_grad_norm_(self.CTClip.parameters(), self.max_grad_norm)
+            self.maybe_print(f"Loss requires_grad: {loss.requires_grad}")
+            self.maybe_print(f"Loss grad_fn: {loss.grad_fn}")
+            self.maybe_print(f"Loss grad: {loss.grad}")
 
-        self.optim.step()
-        self.optim.zero_grad()
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    self.maybe_print(f"{name}.grad = {param.grad}")
 
-        logs['loss'] = loss.item()
+            if self.max_grad_norm:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
+            self.optim.step()
+            self.optim.zero_grad()
+
+        return loss.item()
+
+    def evaluate(self, epoch, validate=False):
+        """
+        Evaluates the model, computes combined loss, and logs results.
+        """
+        self.model.eval()
+        if validate:
+            predictions, targets = [], []
+            total_val_loss = 0.0
+
+            self.maybe_print(f"Evaluating epoch {epoch}")
+
+            for i, batch in enumerate(self.valid_dl):
+                images, texts, labels, name_acc = [b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch]
+                images = images.to(self.accelerator.device)
+                predicted_labels = torch.zeros(len(PATHOLOGIES), dtype=torch.long, device=self.accelerator.device)
+
+                for j, pathology in enumerate(PATHOLOGIES):
+                    text = [f"There is {pathology}.", f"There is no {pathology}."]
+
+                    # Tokenize the text prompts
+                    text_tokens = self.tokenizer(
+                        text,
+                        return_tensors="pt",
+                        padding="max_length",
+                        truncation=True,
+                        max_length=512
+                    ).to(self.accelerator.device)
+
+                    # Get loss and predictions
+                    val_loss, sim_matrix = self.model(text_tokens, images)
+                    total_val_loss += val_loss.item()
+
+                    # Apply softmax to get probabilities
+                    sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=-1)
+
+                    # Extract diagonal elements to get predictions for each sample
+                    present_scores = torch.diag(sim_matrix[:, 0, :])  # Present prompt scores
+                    absent_scores = torch.diag(sim_matrix[:, 1, :])   # Absent prompt scores
+
+                    # Compare scores to get predictions
+                    predicted_class = (present_scores > absent_scores).long()
+
+                    # Select the predictions corresponding to the current device
+                    device_prediction = predicted_class[self.accelerator.process_index]
+
+                    # Store the single prediction for the current pathology
+                    predicted_labels[j] = device_prediction.item()
+
+                predictions.append(predicted_labels)
+                targets.append(labels.to(self.accelerator.device))
+
+            # Compute average validation loss
+            avg_val_loss = total_val_loss / (len(self.valid_dl) * len(PATHOLOGIES))
+            self.valid_losses.append(avg_val_loss)
+
+            # Convert predictions and targets to tensors
+            predictions = torch.stack(predictions)
+            targets = torch.stack(targets)
+
+            # Gather across devices
+            predictions, targets = self.accelerator.gather_for_metrics((predictions, targets))
+            targets = targets.squeeze(dim=1).cpu().numpy()
+            predictions = predictions.cpu().numpy()
+
+        # Compute evaluation metrics
         if self.accelerator.is_main_process:
-            logger.info(f"Step {self.steps}: Loss = {logs['loss']}")
+            if validate:
+                self.maybe_print(f"Computing metrics at epoch {epoch}")
+                metrics = calculate_metrics(predictions, targets, PATHOLOGIES)
+                self.valid_accuracies.append(metrics["mAP"])
+                self.metrics.append(metrics)
 
-        if self.steps % self.save_results_every == 0:
-            self.evaluate_and_save()
+                # Save metrics and plots
+                save_metrics(self.metrics, PATHOLOGIES, self.results_folder)
+                plot_precision_recall_curve(targets, predictions, PATHOLOGIES, self.results_folder, epoch)
+                plot_roc_curve(targets, predictions, PATHOLOGIES, self.results_folder, epoch)
+                plot_per_class_f1(metrics, PATHOLOGIES, self.results_folder, epoch)
+                plot_all_metrics(self.metrics, self.results_folder)
 
-        if self.steps % self.save_model_every == 0 and self.accelerator.is_main_process:
-            model_path = self.results_folder / f'CTClip.{self.steps}.pt'
-            self.save_model(model_path)
-            logger.info(f"Model saved at {model_path}")
+                # Log validation loss
+                self.maybe_print(f"Epoch {epoch} - Validation Loss: {avg_val_loss:.4f}")
 
-        self.steps += 1
-        return logs
+                # Check for best score
+                validation_metric = metrics["mAP"]
+                if validation_metric > self.best_score and self.save_best_model:
+                    self.best_score = validation_metric
+                    self.save_model(
+                        "best_checkpoint.pt",
+                        f"New best model saved at epoch {epoch}, with mean average precision {validation_metric:.4f}"
+                    )
+            else:
+                self.valid_losses.append(0)
+                self.valid_accuracies.append(0)
 
-    def evaluate_and_save(self):
-        """Evaluate the model on validation data and save results."""
-        self.CTClip.eval()
-        pathologies = [
-            'Medical material', 'Arterial wall calcification', 'Cardiomegaly',
-            'Pericardial effusion', 'Coronary artery wall calcification', 'Hiatal hernia',
-            'Lymphadenopathy', 'Emphysema', 'Atelectasis', 'Lung nodule',
-            'Lung opacity', 'Pulmonary fibrotic sequela', 'Pleural effusion',
-            'Mosaic attenuation pattern', 'Peribronchial thickening', 'Consolidation',
-            'Bronchiectasis', 'Interlobular septal thickening'
-        ]
+            # Plot training progress
+            plot_training_progress(
+                self.train_losses,
+                self.valid_losses,
+                self.valid_accuracies,
+                self.results_folder
+            )
 
-        results_path = self.results_folder / f"CTClip_{self.steps}"
-        results_path.mkdir(parents=True, exist_ok=True)
-
-        predicted_all, real_all = [], []
-
-        for _ in range(10):
-            image, _, labels, _ = next(self.valid_dl_iter)
-            image = image.to(self.accelerator.device)
-            predicted_labels = []
-
-            for pathology in pathologies:
-                text = [f"There is {pathology}.", f"There is no {pathology}."]
-                text_tokens = self.tokenizer(
-                    text,
-                    return_tensors="pt",
-                    padding="max_length",
-                    truncation=True,
-                    max_length=512
-                ).to(self.accelerator.device)
-
-                output, _ = self.CTClip(text_tokens, image, return_loss=False)
-                output = torch.nn.functional.softmax(output, dim=0)
-                predicted_class = (output[:, 0] > output[:, 1]).long()  # Compare probabilities
-                predicted_labels.extend(predicted_class.tolist())
-
-            predicted_all.append(predicted_labels)
-            real_all.append(labels.cpu().numpy())
-
-        # Gather predictions and labels from all ranks
-        predicted_all = self.accelerator.gather_for_metrics(predicted_all)
-        real_all = self.accelerator.gather_for_metrics(real_all)
-        
-        if self.accelerator.is_main_process:
-            predicted_all = np.array(predicted_all)
-            real_all = np.array(real_all).squeeze(axis=1)
-
-            metrics = calculate_metrics(predicted_all, real_all, pathologies)
-            save_metrics(metrics, pathologies, results_path)
-
-            plot_precision_recall_curve(real_all, predicted_all, pathologies, results_path)
-            plot_roc_curve(real_all, predicted_all, pathologies, results_path)
-            plot_per_class_f1(metrics, pathologies, results_path)
-
-            # Compute mean ROC AUC for evaluation
-            macro_f1 = np.mean(metrics['macro_f1'])
-
-            # Save best model based on ROC AUC
-            if macro_f1 > self.best_score:  # Replace with `macro_f1` if preferred
-                self.best_score = macro_f1
-                best_model_path = self.best_model_path / f"best_checkpoint_{self.steps}.pt"
-                self.save_model(best_model_path)
-                logger.info(f"New best model saved at step {self.steps} with macro_f1 = {macro_f1:.4f}")
+    def avg_device_loss(self, loss):
+        """
+        Gathers loss accross devices and returns the average.
+        """
+        loss_tensor = torch.tensor(loss, device=self.accelerator.device)
+        gathered_losses = self.accelerator.gather_for_metrics(loss_tensor)
+        return gathered_losses.mean().item()
 
     def train(self):
-        while self.steps < self.num_train_steps:
-            self.train_step()
-        logger.info("Training complete.")
+        """
+        Runs distributed training.
+        """
+        save_at = len(self.train_dl) // self.num_save_split
+        self.maybe_print("Training started")
+
+        for epoch in range(1, self.num_epochs + 1):
+            self.maybe_print(f"\nStarting Epoch {epoch}/{self.num_epochs}")
+
+            self.train_sampler.set_epoch(epoch)
+            total_loss = 0.0
+        
+            for step, batch in enumerate(self.train_dl, start=1):
+                loss = self.train_step(batch)
+                total_loss += loss
+                avg_step_loss = self.avg_device_loss(loss)
+
+                if step % save_at == 0:
+                    self.train_losses.setdefault("steps", []).append(avg_step_loss)
+                    
+                # First epoch"s first step loss is also first epoch 0 loss
+                if epoch == 1 and step == 1:
+                    self.train_losses.setdefault("epochs", []).append(avg_step_loss)
+                    self.train_losses.setdefault("steps", []).append(avg_step_loss)
+                    self.evaluate(0)
+
+                self.maybe_print(f"Epoch {epoch} | Step {step}/{len(self.train_dl)} | Avg Loss: {avg_step_loss:.6f}")
+
+            avg_epoch_loss = self.avg_device_loss(total_loss / len(self.train_dl))
+            self.train_losses.setdefault("epochs", []).append(avg_epoch_loss)
+
+            self.maybe_print(f"Epoch {epoch} completed. Average Loss: {avg_epoch_loss:.6f}")
+
+            self.evaluate(epoch)
+
+        self.maybe_print("Training completed")

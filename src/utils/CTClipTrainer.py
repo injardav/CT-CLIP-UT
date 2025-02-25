@@ -2,6 +2,7 @@ import logging
 import numpy as np
 import torch
 import itertools
+import torch.nn.functional as F
 
 from pathlib import Path
 from shutil import rmtree
@@ -159,7 +160,24 @@ class CTClipTrainer(nn.Module):
         self.optim.load_state_dict(pkg["optim"])
         self.model = self.model.to(self.accelerator.device)
 
+    def loss_function(self, sim_matrix):
+        """Compute contrastive loss using similarity matrix."""
+        self.maybe_print(f"sim_matrix.requires_grad: {sim_matrix.requires_grad}")
+        self.maybe_print(f"sim_matrix.grad_fn: {sim_matrix.grad_fn}")
+
+        targets = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
+        loss_i2t = F.cross_entropy(sim_matrix, targets)
+        loss_t2i = F.cross_entropy(sim_matrix.t(), targets)
+        loss = (loss_i2t + loss_t2i) / 2
+
+        # Log loss properties before returning
+        self.maybe_print(f"Loss requires_grad (inside loss_function): {loss.requires_grad}")
+        self.maybe_print(f"Loss grad_fn (inside loss_function): {loss.grad_fn}")
+
+        return loss
+
     def train_step(self, batch):
+        """Performs a single training step."""
         self.model.train()
 
         images, texts = batch
@@ -173,20 +191,40 @@ class CTClipTrainer(nn.Module):
         ).to(self.accelerator.device)
 
         with self.accelerator.accumulate(self.model):
-            loss, _ = self.model(text_tokens, images)
+            self.maybe_print("Checking encoder parameters require_grad:")
+            for name, param in self.model.module.text_encoder.named_parameters():
+                self.maybe_print(f"{name} requires_grad: {param.requires_grad}")
+            for name, param in self.model.module.image_encoder.named_parameters():
+                self.maybe_print(f"{name} requires_grad: {param.requires_grad}")
+
+            # Compute similarity matrix
+            sim_matrix = self.model(text_tokens, images)
+            sim_matrix.retain_grad()
+
+            # Compute loss
+            loss = self.loss_function(sim_matrix)
+
+            # Backpropagate loss
             self.accelerator.backward(loss)
 
-            self.maybe_print(f"Loss requires_grad: {loss.requires_grad}")
-            self.maybe_print(f"Loss grad_fn: {loss.grad_fn}")
-            self.maybe_print(f"Loss grad: {loss.grad}")
-
+            # Check if gradients are flowing to model parameters
+            self.maybe_print("Checking parameter gradients after backward:")
             for name, param in self.model.named_parameters():
                 if param.grad is not None:
-                    self.maybe_print(f"{name}.grad = {param.grad}")
+                    self.maybe_print(f"{name}.grad = {param.grad.mean().item()} (mean value)")
 
+            for name, param in self.model.module.text_encoder.named_parameters():
+                if param.grad is None:
+                    self.maybe_print(f"🚨 {name} (text encoder) has no gradients!")
+            for name, param in self.model.module.image_encoder.named_parameters():
+                if param.grad is None:
+                    self.maybe_print(f"🚨 {name} (image encoder) has no gradients!")
+
+            # Clip gradients if necessary
             if self.max_grad_norm:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
+            # Optimizer step
             self.optim.step()
             self.optim.zero_grad()
 

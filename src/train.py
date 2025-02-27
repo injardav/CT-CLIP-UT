@@ -56,10 +56,10 @@ trainer = CTClipTrainer(
     results_folder = "/mnt/ct_clip/CT-CLIP-UT/src/results",
     batch_size = 1,
     num_workers = 4,
-    num_epochs = 3,
+    num_epochs = 15,
     num_save_split = 1,
-    num_train_samples = 8,
-    num_valid_samples = 8
+    num_train_samples = 5000,
+    num_valid_samples = 1000
 )
 
 trainer.train()

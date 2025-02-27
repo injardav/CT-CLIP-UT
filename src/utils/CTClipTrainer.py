@@ -77,6 +77,7 @@ class CTClipTrainer(nn.Module):
 
         self.model = model
         self.model.accelerator = self.accelerator
+        self.model.to(self.accelerator.device)
         self.tokenizer = tokenizer or BertTokenizer.from_pretrained(
             "microsoft/BiomedVLP-CXR-BERT-specialized",
             do_lower_case=True
@@ -160,26 +161,43 @@ class CTClipTrainer(nn.Module):
         self.optim.load_state_dict(pkg["optim"])
         self.model = self.model.to(self.accelerator.device)
 
-    def loss_function(self, sim_matrix):
+    def loss_function(self, sim_matrix, targets=None):
         """Compute contrastive loss using similarity matrix."""
-        self.maybe_print(f"sim_matrix.requires_grad: {sim_matrix.requires_grad}")
-        self.maybe_print(f"sim_matrix.grad_fn: {sim_matrix.grad_fn}")
+        if targets is None:
+            targets = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
 
-        targets = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
         loss_i2t = F.cross_entropy(sim_matrix, targets)
         loss_t2i = F.cross_entropy(sim_matrix.t(), targets)
         loss = (loss_i2t + loss_t2i) / 2
 
-        # Log loss properties before returning
-        self.maybe_print(f"Loss requires_grad (inside loss_function): {loss.requires_grad}")
-        self.maybe_print(f"Loss grad_fn (inside loss_function): {loss.grad_fn}")
-
         return loss
+    
+    def validate_prompts(self, image_latents, text_latents, temp):
+        """Compute evaluation loss based on both given text prompts."""
+        text_latents_present = text_latents[::2]  # Shape: [B, embed_dim]
+        text_latents_absent = text_latents[1::2]  # Shape: [B, embed_dim]
+
+        # Compute separate similarity matrices for present and absent prompts.
+        sim_matrix_present = image_latents @ text_latents_present.t() / temp  # Shape: [B, B]
+        sim_matrix_absent  = image_latents @ text_latents_absent.t()  / temp  # Shape: [B, B]
+
+        # Compute targets based on image_latents
+        targets = torch.arange(image_latents.shape[0], device=sim_matrix_present.device)
+
+        # Compute cross-entropy losses in both directions for each prompt type.
+        loss_present = self.loss_function(sim_matrix_present, targets)
+        loss_absent = self.loss_function(sim_matrix_absent, targets)
+
+        loss = (loss_present + loss_absent) / 2
+        sim_matrix = torch.stack([sim_matrix_present, sim_matrix_absent], dim=1)  # Shape: [B, 2, B]
+
+        return loss, sim_matrix
 
     def train_step(self, batch):
         """Performs a single training step."""
         self.model.train()
-
+        self.optim.zero_grad()
+        
         images, texts = batch
         images = images.to(self.accelerator.device)
         text_tokens = self.tokenizer(
@@ -190,47 +208,19 @@ class CTClipTrainer(nn.Module):
             max_length=512
         ).to(self.accelerator.device)
 
-        with self.accelerator.accumulate(self.model):
-            self.maybe_print("Checking encoder parameters require_grad:")
-            for name, param in self.model.module.text_encoder.named_parameters():
-                self.maybe_print(f"{name} requires_grad: {param.requires_grad}")
-            for name, param in self.model.module.image_encoder.named_parameters():
-                self.maybe_print(f"{name} requires_grad: {param.requires_grad}")
+        sim_matrix, _, _, _ = self.model(text_tokens, images)
+        loss = self.loss_function(sim_matrix)
+        self.accelerator.backward(loss)
 
-            # Compute similarity matrix
-            sim_matrix = self.model(text_tokens, images)
-            sim_matrix.retain_grad()
+        # Clip gradients if necessary
+        if self.max_grad_norm and self.accelerator.sync_gradients:
+            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-            # Compute loss
-            loss = self.loss_function(sim_matrix)
-
-            # Backpropagate loss
-            self.accelerator.backward(loss)
-
-            # Check if gradients are flowing to model parameters
-            self.maybe_print("Checking parameter gradients after backward:")
-            for name, param in self.model.named_parameters():
-                if param.grad is not None:
-                    self.maybe_print(f"{name}.grad = {param.grad.mean().item()} (mean value)")
-
-            for name, param in self.model.module.text_encoder.named_parameters():
-                if param.grad is None:
-                    self.maybe_print(f"🚨 {name} (text encoder) has no gradients!")
-            for name, param in self.model.module.image_encoder.named_parameters():
-                if param.grad is None:
-                    self.maybe_print(f"🚨 {name} (image encoder) has no gradients!")
-
-            # Clip gradients if necessary
-            if self.max_grad_norm:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
-            # Optimizer step
-            self.optim.step()
-            self.optim.zero_grad()
+        self.optim.step()
 
         return loss.item()
 
-    def evaluate(self, epoch, validate=False):
+    def evaluate(self, epoch, validate=True):
         """
         Evaluates the model, computes combined loss, and logs results.
         """
@@ -242,8 +232,7 @@ class CTClipTrainer(nn.Module):
             self.maybe_print(f"Evaluating epoch {epoch}")
 
             for i, batch in enumerate(self.valid_dl):
-                images, texts, labels, name_acc = [b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch]
-                images = images.to(self.accelerator.device)
+                images, _, labels, _ = [b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch]
                 predicted_labels = torch.zeros(len(PATHOLOGIES), dtype=torch.long, device=self.accelerator.device)
 
                 for j, pathology in enumerate(PATHOLOGIES):
@@ -259,7 +248,8 @@ class CTClipTrainer(nn.Module):
                     ).to(self.accelerator.device)
 
                     # Get loss and predictions
-                    val_loss, sim_matrix = self.model(text_tokens, images)
+                    _, image_latents, text_latents, temp = self.model(text_tokens, images)
+                    val_loss, sim_matrix = self.validate_prompts(image_latents, text_latents, temp)
                     total_val_loss += val_loss.item()
 
                     # Apply softmax to get probabilities
@@ -349,12 +339,12 @@ class CTClipTrainer(nn.Module):
 
         for epoch in range(1, self.num_epochs + 1):
             self.maybe_print(f"\nStarting Epoch {epoch}/{self.num_epochs}")
-
             self.train_sampler.set_epoch(epoch)
             total_loss = 0.0
         
             for step, batch in enumerate(self.train_dl, start=1):
-                loss = self.train_step(batch)
+                with self.accelerator.autocast():
+                    loss = self.train_step(batch)
                 total_loss += loss
                 avg_step_loss = self.avg_device_loss(loss)
 

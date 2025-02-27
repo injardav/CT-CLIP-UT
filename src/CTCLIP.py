@@ -2,8 +2,43 @@ import torch
 import math
 import numpy as np
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch import nn
 from pathlib import Path
+
+
+class GatherWithGrad(torch.autograd.Function):
+    """
+    Custom autograd function to perform all_gather while preserving gradients.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor):
+        world_size = dist.get_world_size()
+        if world_size == 1:
+            return tensor
+
+        gathered_tensors = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered_tensors, tensor.contiguous())
+
+        # Concatenate all gathered tensors along batch dimension
+        gathered_tensor = torch.cat(gathered_tensors, dim=0)
+
+        return gathered_tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Ensure gradients are correctly propagated back to the original inputs.
+        """
+        world_size = dist.get_world_size()
+        if world_size == 1:
+            return grad_output
+
+        grad_list = list(grad_output.chunk(world_size, dim=0))
+        grad_input = grad_list[dist.get_rank()]  # Extract only the gradient part belonging to this rank
+
+        return grad_input
 
 
 class CTCLIP(nn.Module):
@@ -53,6 +88,12 @@ class CTCLIP(nn.Module):
         except Exception as e:
             raise RuntimeError(f"Failed to load state dictionary from {path}: {e}")
 
+    def gather_features(self, features):
+        """
+        Gather features across devices while maintaining gradients.
+        """
+        return GatherWithGrad.apply(features)
+
     def forward(self, text_inputs, image_inputs):
         """
         Forward pass for CTCLIP with spatial token contrast.
@@ -64,9 +105,6 @@ class CTCLIP(nn.Module):
         text_output = self.text_encoder(**text_inputs).last_hidden_state[:, 0, :]
         image_output = self.image_encoder(image_inputs)[-1].mean(dim=[2, 3, 4])
 
-        text_output.retain_grad()
-        image_output.retain_grad()
-
         # --- Projection ---
         text_latents = self.to_text_latent(text_output)
         image_latents = self.to_image_latent(image_output)
@@ -76,59 +114,10 @@ class CTCLIP(nn.Module):
         image_latents = image_latents / image_latents.norm(dim=-1, keepdim=True)
 
         # --- Gather across devices (if applicable) ---
-        text_latents = self.accelerator.gather(text_latents)
-        image_latents = self.accelerator.gather(image_latents)
+        text_latents = self.gather_features(text_latents)
+        image_latents = self.gather_features(image_latents)
 
         # --- Similarity Matrix ---
         sim_matrix = image_latents @ text_latents.t() / self.log_temperature.exp()
 
-        return sim_matrix
-
-        # # --- Loss Computation ---
-        # batch_size = image_latents.shape[0]
-        # num_text_prompts = 2  # expected when two text prompts per image are provided (validation mode)
-
-        # if text_latents.shape[0] == batch_size * num_text_prompts:
-        #     # Validation mode: each image has two associated text prompts.
-        #     # Split text latents into two groups based on assumed interleaved order:
-        #     # even indices: present prompts, odd indices: absent prompts.
-        #     text_latents_present = text_latents[::2]  # Shape: [B, embed_dim]
-        #     text_latents_absent = text_latents[1::2]  # Shape: [B, embed_dim]
-
-        #     # Compute separate similarity matrices for present and absent prompts.
-        #     sim_matrix_present = image_latents @ text_latents_present.t() / temp  # Shape: [B, B]
-        #     sim_matrix_absent  = image_latents @ text_latents_absent.t()  / temp  # Shape: [B, B]
-
-        #     # Create ground truth targets (diagonal elements correspond to positives).
-        #     targets = torch.arange(batch_size, device=sim_matrix_present.device)
-
-        #     # Compute cross-entropy losses in both directions for each prompt type.
-        #     loss_i2t_present = F.cross_entropy(sim_matrix_present, targets)
-        #     loss_t2i_present = F.cross_entropy(sim_matrix_present.t(), targets)
-        #     loss_present = (loss_i2t_present + loss_t2i_present) / 2
-
-        #     loss_i2t_absent  = F.cross_entropy(sim_matrix_absent, targets)
-        #     loss_t2i_absent  = F.cross_entropy(sim_matrix_absent.t(), targets)
-        #     loss_absent = (loss_i2t_absent + loss_t2i_absent) / 2
-
-        #     # Average the losses for the two prompt types.
-        #     loss = (loss_present + loss_absent) / 2
-
-        #     # For reporting, stack the two similarity matrices.
-        #     sim_matrix = torch.stack([sim_matrix_present, sim_matrix_absent], dim=1)  # Shape: [B, 2, B]
-        # else:
-        #     # Training mode: standard single text prompt per image.
-        #     targets = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
-        #     loss_i2t = F.cross_entropy(sim_matrix, targets)
-        #     loss_t2i = F.cross_entropy(sim_matrix.t(), targets)
-        #     loss = (loss_i2t + loss_t2i) / 2
-
-        # # Debug prints for monitoring.
-        # maybe_print(f"Final loss: {loss.item()}")
-        # maybe_print(f"Logits mean: {sim_matrix.mean().item()}, std: {sim_matrix.std().item()}")
-
-        # maybe_print(f"Loss grad: {loss.grad}")
-        # maybe_print(f"Sim matrix grad: {sim_matrix.grad}")
-
-        # return loss, sim_matrix
-
+        return sim_matrix, image_latents, text_latents, self.log_temperature.exp()

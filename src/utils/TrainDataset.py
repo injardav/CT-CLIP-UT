@@ -53,11 +53,17 @@ class TrainDataset(Dataset):
 
     def _nii_img_to_tensor(self, path):
         """Load a preprocessed .npz file as a tensor."""
-        img_data = np.load(path)['arr_0']
-        tensor = torch.tensor(img_data, dtype=torch.float32)
-        tensor = tensor.unsqueeze(0)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"File not found: {path}")
 
-        return tensor
+        try:
+            img_data = np.load(path)['arr_0']
+        except zipfile.BadZipFile:
+            raise RuntimeError(f"Corrupted file: {path}")
+        except Exception as e:
+            raise RuntimeError(f"Error loading {path}: {e}")
+
+        return torch.tensor(img_data, dtype=torch.float32).unsqueeze(0)
 
     def __len__(self):
         return len(self.samples)

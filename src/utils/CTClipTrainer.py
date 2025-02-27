@@ -77,7 +77,6 @@ class CTClipTrainer(nn.Module):
 
         self.model = model
         self.model.accelerator = self.accelerator
-        self.model.to(self.accelerator.device)
         self.tokenizer = tokenizer or BertTokenizer.from_pretrained(
             "microsoft/BiomedVLP-CXR-BERT-specialized",
             do_lower_case=True
@@ -161,6 +160,14 @@ class CTClipTrainer(nn.Module):
         self.optim.load_state_dict(pkg["optim"])
         self.model = self.model.to(self.accelerator.device)
 
+    def avg_device_loss(self, loss):
+        """
+        Gathers loss accross devices and returns the average.
+        """
+        loss_tensor = torch.tensor(loss, device=self.accelerator.device)
+        gathered_losses = self.accelerator.gather_for_metrics(loss_tensor)
+        return gathered_losses.mean().item()
+
     def loss_function(self, sim_matrix, targets=None):
         """Compute contrastive loss using similarity matrix."""
         if targets is None:
@@ -182,16 +189,14 @@ class CTClipTrainer(nn.Module):
         sim_matrix_absent  = image_latents @ text_latents_absent.t()  / temp  # Shape: [B, B]
 
         # Compute targets based on image_latents
-        targets = torch.arange(image_latents.shape[0], device=sim_matrix_present.device)
+        # targets = torch.arange(image_latents.shape[0], device=image_latents.device)
 
         # Compute cross-entropy losses in both directions for each prompt type.
-        loss_present = self.loss_function(sim_matrix_present, targets)
-        loss_absent = self.loss_function(sim_matrix_absent, targets)
+        # loss_present = self.loss_function(sim_matrix_present, targets)
+        # loss_absent = self.loss_function(sim_matrix_absent, targets)
+        # loss = (loss_present + loss_absent) / 2
 
-        loss = (loss_present + loss_absent) / 2
-        sim_matrix = torch.stack([sim_matrix_present, sim_matrix_absent], dim=1)  # Shape: [B, 2, B]
-
-        return loss, sim_matrix
+        return sim_matrix_present, sim_matrix_absent
 
     def train_step(self, batch):
         """Performs a single training step."""
@@ -232,8 +237,21 @@ class CTClipTrainer(nn.Module):
             self.maybe_print(f"Evaluating epoch {epoch}")
 
             for i, batch in enumerate(self.valid_dl):
-                images, _, labels, _ = [b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch]
+                images, texts, labels, _ = [b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch]
                 predicted_labels = torch.zeros(len(PATHOLOGIES), dtype=torch.long, device=self.accelerator.device)
+
+                text_tokens = self.tokenizer(
+                    texts,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=512
+                ).to(self.accelerator.device)
+
+                # Forward pass with original text for true validation loss
+                sim_matrix, _, _, _ = self.model(text_tokens, images)
+                val_loss = self.loss_function(sim_matrix)
+                total_val_loss += val_loss.item()
 
                 for j, pathology in enumerate(PATHOLOGIES):
                     text = [f"There is {pathology}.", f"There is no {pathology}."]
@@ -247,32 +265,26 @@ class CTClipTrainer(nn.Module):
                         max_length=512
                     ).to(self.accelerator.device)
 
-                    # Get loss and predictions
+                    # Forward pass of text prompts for pathology predictions
                     _, image_latents, text_latents, temp = self.model(text_tokens, images)
-                    val_loss, sim_matrix = self.validate_prompts(image_latents, text_latents, temp)
-                    total_val_loss += val_loss.item()
-
-                    # Apply softmax to get probabilities
-                    sim_matrix = torch.nn.functional.softmax(sim_matrix, dim=-1)
+                    sim_matrix_present, sim_matrix_absent = self.validate_prompts(image_latents, text_latents, temp)
 
                     # Extract diagonal elements to get predictions for each sample
-                    present_scores = torch.diag(sim_matrix[:, 0, :])  # Present prompt scores
-                    absent_scores = torch.diag(sim_matrix[:, 1, :])   # Absent prompt scores
+                    present_scores = torch.diag(sim_matrix_present)  # Present prompt scores
+                    absent_scores = torch.diag(sim_matrix_absent)    # Absent prompt scores
 
-                    # Compare scores to get predictions
+                    # Apply softmax to the extracted diagonal scores, compute and save predictions
+                    probabilities = torch.nn.functional.softmax(torch.stack([present_scores, absent_scores], dim=1), dim=1)
+                    present_scores, absent_scores = probabilities[:, 0], probabilities[:, 1]
                     predicted_class = (present_scores > absent_scores).long()
-
-                    # Select the predictions corresponding to the current device
                     device_prediction = predicted_class[self.accelerator.process_index]
-
-                    # Store the single prediction for the current pathology
                     predicted_labels[j] = device_prediction.item()
 
                 predictions.append(predicted_labels)
-                targets.append(labels.to(self.accelerator.device))
+                targets.append(labels)
 
             # Compute average validation loss
-            avg_val_loss = total_val_loss / (len(self.valid_dl) * len(PATHOLOGIES))
+            avg_val_loss = self.avg_device_loss(total_val_loss / len(self.valid_dl))
             self.valid_losses.append(avg_val_loss)
 
             # Convert predictions and targets to tensors
@@ -299,7 +311,6 @@ class CTClipTrainer(nn.Module):
                 plot_per_class_f1(metrics, PATHOLOGIES, self.results_folder, epoch)
                 plot_all_metrics(self.metrics, self.results_folder)
 
-                # Log validation loss
                 self.maybe_print(f"Epoch {epoch} - Validation Loss: {avg_val_loss:.4f}")
 
                 # Check for best score
@@ -314,21 +325,12 @@ class CTClipTrainer(nn.Module):
                 self.valid_losses.append(0)
                 self.valid_accuracies.append(0)
 
-            # Plot training progress
             plot_training_progress(
                 self.train_losses,
                 self.valid_losses,
                 self.valid_accuracies,
                 self.results_folder
             )
-
-    def avg_device_loss(self, loss):
-        """
-        Gathers loss accross devices and returns the average.
-        """
-        loss_tensor = torch.tensor(loss, device=self.accelerator.device)
-        gathered_losses = self.accelerator.gather_for_metrics(loss_tensor)
-        return gathered_losses.mean().item()
 
     def train(self):
         """
@@ -361,9 +363,7 @@ class CTClipTrainer(nn.Module):
 
             avg_epoch_loss = self.avg_device_loss(total_loss / len(self.train_dl))
             self.train_losses.setdefault("epochs", []).append(avg_epoch_loss)
-
             self.maybe_print(f"Epoch {epoch} completed. Average Loss: {avg_epoch_loss:.6f}")
-
             self.evaluate(epoch)
 
         self.maybe_print("Training completed")

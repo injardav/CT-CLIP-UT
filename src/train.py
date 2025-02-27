@@ -58,8 +58,8 @@ trainer = CTClipTrainer(
     num_workers = 4,
     num_epochs = 15,
     num_save_split = 1,
-    num_train_samples = 5000,
-    num_valid_samples = 1000
+    num_train_samples = 10000,
+    num_valid_samples = 2000
 )
 
 trainer.train()

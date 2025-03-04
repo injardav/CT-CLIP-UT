@@ -103,7 +103,15 @@ class CTCLIP(nn.Module):
 
         # --- Encoding ---
         text_output = self.text_encoder(**text_inputs).last_hidden_state[:, 0, :]
-        image_output = self.image_encoder(image_inputs)[-1].mean(dim=[2, 3, 4])
+
+        # swin encoder approach
+        image_output = self.image_encoder(image_inputs)[-1]
+        image_output = image_output.mean(dim=[2, 3, 4])
+
+        # vit encoder approach
+        # image_output = self.image_encoder(image_inputs)
+        # image_output = image_output.mean(dim=1)
+        # image_output = image_output.view(image_output.shape[0], -1)
 
         # --- Projection ---
         text_latents = self.to_text_latent(text_output)

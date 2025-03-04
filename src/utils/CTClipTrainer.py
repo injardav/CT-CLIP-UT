@@ -147,7 +147,7 @@ class CTClipTrainer(nn.Module):
                 "model": self.accelerator.get_state_dict(unwrapped_model),
                 "optim": self.optim.state_dict()
             }
-            torch.save(pkg, self.results_folder / name)
+            torch.save(pkg, str(self.results_folder / name))
             with open(self.results_folder / "architecture.txt", "w") as f:
                 f.write(str(unwrapped_model))
 
@@ -315,7 +315,7 @@ class CTClipTrainer(nn.Module):
 
                 # Check for best score
                 validation_metric = metrics["mAP"]
-                if validation_metric > self.best_score and self.save_best_model:
+                if epoch == 0 or (validation_metric > self.best_score and self.save_best_model):
                     self.best_score = validation_metric
                     self.save_model(
                         "best_checkpoint.pt",

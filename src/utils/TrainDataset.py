@@ -3,9 +3,9 @@ import glob
 import torch
 import pandas as pd
 import numpy as np
+import zipfile
 from torch.utils.data import Dataset
 from functools import partial
-import nibabel as nib
 
 
 class TrainDataset(Dataset):

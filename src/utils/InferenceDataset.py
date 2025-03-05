@@ -7,27 +7,30 @@ import numpy as np
 import zipfile
 from torch.utils.data import Dataset
 from functools import partial
+from utils.preprocess import process_file
 
 class InferenceDataset(Dataset):
-    def __init__(self, data_folder, reports, labels, num_samples=500):
+    def __init__(self, data_folder, reports, metadata, labels, num_samples=500):
         """
         Dataset for processing CT scans and associated inference data.
 
         Args:
             data_folder (str): Path to the folder containing CT data.
-            reports (str): Path to the CSV file containing report metadata.
+            reports (str): Path to the report CSV file.
+            metadata (str): Path to the metadata CSV file.
             labels (str): Path to the labels CSV file.
             num_samples (int, optional): Number of samples to limit the dataset. Defaults to 500.
         """
         self.data_folder = data_folder
+        self.metadata_df = pd.read_csv(metadata)
         self.labels = labels
-        self.accession_to_text = self._load_accession_text(reports)
+        self.observations = self._load_observations(reports)
         self.samples = self._prepare_samples()
 
         if num_samples < len(self.samples):
             self.samples = self.samples[:num_samples]
 
-    def _load_accession_text(self, reports):
+    def _load_observations(self, reports):
         """Load accession-to-text mapping from a CSV file."""
         df = pd.read_csv(reports)
         return {
@@ -40,36 +43,37 @@ class InferenceDataset(Dataset):
         samples = []
 
         # Read labels once outside the loop
-        test_df = pd.read_csv(self.labels)
-        test_label_cols = list(test_df.columns[1:])
-        test_df['one_hot_labels'] = list(test_df[test_label_cols].values)
+        labels_df = pd.read_csv(self.labels)
+        label_cols = list(labels_df.columns[1:])
+        labels_df['one_hot_labels'] = list(labels_df[label_cols].values)
+     
+        # Traverse directory tree, find scans, fetch observations and true labels
+        for root, _, files in os.walk(self.data_folder):
+            for file in files:
+                if file.endswith(".nii.gz"):
 
-        for patient_folder in glob.glob(os.path.join(self.data_folder, '*')):
-            for accession_folder in glob.glob(os.path.join(patient_folder, '*')):
-                for nii_file in glob.glob(os.path.join(accession_folder, '*.npz')):
-                    accession_number = os.path.basename(nii_file).replace('.npz', '.nii.gz')
-                    if accession_number not in self.accession_to_text:
+                    if file not in self.observations:
                         continue
+                    
+                    file_path = os.path.join(root, file)
+                    findings, impressions = self.observations[file]
+                    onehotlabels = labels_df[labels_df["VolumeName"] == file]["one_hot_labels"].values
 
-                    findings, impressions = self.accession_to_text[accession_number]
-                    text_final = findings + impressions
-
-                    onehotlabels = test_df[test_df["VolumeName"] == accession_number]["one_hot_labels"].values
                     if len(onehotlabels) > 0:
-                        samples.append((nii_file, text_final, onehotlabels[0], accession_number.split('.nii.gz')[0]))
-                        
+                        samples.append((file_path, findings + impressions, onehotlabels[0], file))
+
         return samples
 
     def __len__(self):
         return len(self.samples)
 
-    def _nii_img_to_tensor(self, path):
-        """Load a preprocessed .npz file as a tensor."""
+    def _preprocess_scan(self, path, name):
+        """Preprocess a raw NIfTI CT scan to tensor."""
         if not os.path.exists(path):
             raise FileNotFoundError(f"File not found: {path}")
 
         try:
-            img_data = np.load(path)['arr_0']
+            img_data = process_file(path, name, self.metadata_df)
         except zipfile.BadZipFile:
             raise RuntimeError(f"Corrupted file: {path}")
         except Exception as e:
@@ -78,11 +82,11 @@ class InferenceDataset(Dataset):
         return torch.tensor(img_data, dtype=torch.float32).unsqueeze(0)
 
     def __getitem__(self, index):
-        nii_file, input_text, onehotlabels, scan_name = self.samples[index]
-        image_tensor = self._nii_img_to_tensor(nii_file)
-        input_text = input_text.replace('"', '')  
-        input_text = input_text.replace('\'', '')  
-        input_text = input_text.replace('(', '')  
-        input_text = input_text.replace(')', '').strip()
+        path, observations, onehotlabels, name = self.samples[index]
+        tensor = self._preprocess_scan(path, name)
+        observations = observations.replace('"', '')  
+        observations = observations.replace('\'', '')  
+        observations = observations.replace('(', '')  
+        observations = observations.replace(')', '').strip()
 
-        return image_tensor, input_text, onehotlabels, scan_name
+        return tensor, observations, onehotlabels, name

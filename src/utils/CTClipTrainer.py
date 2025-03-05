@@ -1,4 +1,3 @@
-import logging
 import numpy as np
 import torch
 import itertools
@@ -22,8 +21,6 @@ from utils.metrics import *
 from CTCLIP import CTCLIP
 from utils.optimizer import get_optimizer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
-logger = logging.getLogger(__name__)
 
 PATHOLOGIES = [
             "Medical material", "Arterial wall calcification", "Cardiomegaly",
@@ -33,6 +30,7 @@ PATHOLOGIES = [
             "Mosaic attenuation pattern", "Peribronchial thickening", "Consolidation",
             "Bronchiectasis", "Interlobular septal thickening"
         ]
+
 
 class CTClipTrainer(nn.Module):
     """
@@ -49,6 +47,7 @@ class CTClipTrainer(nn.Module):
         valid_reports: str,
         valid_labels: str,
         train_metadata: str,
+        valid_metadata: str,
         tokenizer: BertTokenizer = None,
         lr: float = 1.25e-5,
         wd: float = 0.0,
@@ -70,9 +69,6 @@ class CTClipTrainer(nn.Module):
             mixed_precision="fp16",
             device_placement=True
         )
-
-        log_level = logging.INFO if self.accelerator.is_main_process else logging.ERROR
-        logging.basicConfig(level=log_level, format="%(asctime)s - %(message)s")
         self.maybe_print = print if self.accelerator.is_main_process else lambda *args, **kwargs: None
 
         self.model = model
@@ -89,7 +85,7 @@ class CTClipTrainer(nn.Module):
         self.save_best_model = save_best_model
 
         self.train_ds = TrainDataset(data_folder=data_train, reports=train_reports, metadata=train_metadata, num_samples=num_train_samples)
-        self.valid_ds = InferenceDataset(data_folder=data_valid, reports=valid_reports, labels=valid_labels, num_samples=num_valid_samples)
+        self.valid_ds = InferenceDataset(data_folder=data_valid, reports=valid_reports, metadata=valid_metadata, labels=valid_labels, num_samples=num_valid_samples)
 
         self.train_sampler = DistributedSampler(
             self.train_ds,

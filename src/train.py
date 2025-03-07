@@ -63,13 +63,13 @@ clip.load("/mnt/ct_clip/models/CT-CLIP_v2.pt", strict=False)
 
 trainer = CTClipTrainer(
     clip,
-    train_reports = "/mnt/ct_clip_data/reports/train_reports.csv",
-    valid_reports = "/mnt/ct_clip_data/reports/valid_reports.csv",
+    train_reports = "/mnt/ct_clip/CT-CLIP-UT/reports/train_reports.csv",
+    valid_reports = "/mnt/ct_clip/CT-CLIP-UT/reports/valid_reports.csv",
     data_train = "/mnt/ct_clip_data/data_volumes/dataset/train",
     data_valid = "/mnt/ct_clip_data/data_volumes/dataset/valid",
-    valid_labels = "/mnt/ct_clip_data/labels/valid_labels.csv",
-    train_metadata = "/mnt/ct_clip_data/metadata/train_metadata.csv",
-    valid_metadata = "/mnt/ct_clip_data/metadata/valid_metadata.csv",
+    valid_labels = "/mnt/ct_clip/CT-CLIP-UT/labels/valid_labels.csv",
+    train_metadata = "/mnt/ct_clip/CT-CLIP-UT/metadata/train_metadata.csv",
+    valid_metadata = "/mnt/ct_clip/CT-CLIP-UT/metadata/valid_metadata.csv",
     results_folder = "/mnt/ct_clip/CT-CLIP-UT/src/results",
     batch_size = 1,
     num_workers = 4,

@@ -93,7 +93,7 @@ class CTCLIP(nn.Module):
         """
         return GatherWithGrad.apply(features)
 
-    def forward(self, text_inputs, image_inputs):
+    def forward(self, text_inputs, image_inputs, inference=False):
         """
         Forward pass for CTCLIP with spatial token contrast.
         """
@@ -108,7 +108,9 @@ class CTCLIP(nn.Module):
         # image_output = image_output.mean(dim=[2, 3, 4])
 
         # vit encoder approach
-        image_output = self.visual_transformer(image_inputs)
+        image_output, attention_weights = self.visual_transformer(image_inputs)
+        if inference:
+            return image_output, attention_weights
         image_output = image_output.mean(dim=1)
         image_output = image_output.view(image_output.shape[0], -1)
 

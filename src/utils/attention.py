@@ -123,15 +123,12 @@ class Attention(nn.Module):
 
         self.to_out = nn.Linear(inner_dim, dim, bias = False)
 
-        self.attention_weights = None
-
     def forward(
         self,
         x,
         mask = None,
         context = None,
-        attn_bias = None,
-        return_attention = False
+        attn_bias = None
     ):
         batch, device, dtype = x.shape[0], x.device, x.dtype
         device=torch.device('cuda')
@@ -177,15 +174,11 @@ class Attention(nn.Module):
         attn = sim.softmax(dim = -1)
         attn = self.attn_dropout(attn)
 
-        self.attention_weights = attn
-
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
 
         out = rearrange(out, 'b h n d -> b n (h d)')
 
-        if return_attention:
-            return self.to_out(out), self.attention_weights
-        return self.to_out(out)
+        return self.to_out(out), attn
 
 # alibi positional bias for extrapolation
 
@@ -323,28 +316,20 @@ class Transformer(nn.Module):
         attn_bias = None,
         context = None,
         self_attn_mask = None,
-        cross_attn_context_mask = None,
-        return_attention = False
+        cross_attn_context_mask = None
     ):
-        self_attention_weights_list = []
+        attention_weights = None
 
         for peg, self_attn, cross_attn, ff in self.layers:
             if exists(peg):
                 x = peg(x, shape = video_shape) + x
 
-            if return_attention:
-                x_out, self_attn_weights  = self_attn(x, attn_bias = attn_bias, mask = self_attn_mask, return_attention=return_attention)
-                self_attention_weights_list.append(self_attn_weights)
-                x = x_out + x
-            else:
-                x = self_attn(x, attn_bias = attn_bias, mask = self_attn_mask) + x
+            x_out, attention_weights = self_attn(x, attn_bias = attn_bias, mask = self_attn_mask)
+            x = x_out + x
 
             if exists(cross_attn) and exists(context):
                 x = cross_attn(x, context = context, mask = cross_attn_context_mask) + x
 
             x = ff(x) + x
-
-        if return_attention:
-            return self.norm_out(x), self_attention_weights_list
         
-        return self.norm_out(x)
+        return self.norm_out(x), attention_weights

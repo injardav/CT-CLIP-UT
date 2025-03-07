@@ -83,20 +83,20 @@ class CTViT(nn.Module):
 
         # Spatial encoding
         tokens = rearrange(tokens, "b t h w d -> (b t) (h w) d")
-        tokens = self.enc_spatial_transformer(tokens, attn_bias=attn_bias, video_shape=video_shape)
+        tokens, attention_weights = self.enc_spatial_transformer(tokens, attn_bias=attn_bias, video_shape=video_shape)
         tokens = rearrange(tokens, "(b t) (h w) d -> b t h w d", b=batch_size, h=self.patch_height, w=self.patch_width)
 
         # Temporal encoding
         tokens = rearrange(tokens, "b t h w d -> (b h w) t d")
-        tokens = self.enc_temporal_transformer(tokens, video_shape=video_shape)
+        tokens, _ = self.enc_temporal_transformer(tokens, video_shape=video_shape)
         tokens = rearrange(tokens, "(b h w) t d -> b t h w d", b=batch_size, h=self.patch_height, w=self.patch_width)
 
-        return tokens
+        return tokens, attention_weights
 
     def forward(self, image):
         tokens = self.to_patch_emb(image)
-        tokens = self.encode(tokens)
+        tokens, attention_weights = self.encode(tokens)
         tokens, _ = pack([tokens], "b * d")
         tokens, _, _ = self.vq(tokens, mask=None)
         tokens = rearrange(tokens, "b (t h w) d -> b t h w d", h=self.patch_height, w=self.patch_width)
-        return tokens
+        return tokens, attention_weights

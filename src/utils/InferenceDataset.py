@@ -1,12 +1,8 @@
 import os
-import glob
-import json
 import torch
 import pandas as pd
-import numpy as np
 import zipfile
 from torch.utils.data import Dataset
-from functools import partial
 from utils.preprocess import process_file
 
 class InferenceDataset(Dataset):
@@ -31,18 +27,16 @@ class InferenceDataset(Dataset):
             self.samples = self.samples[:num_samples]
 
     def _load_observations(self, reports):
-        """Load accession-to-text mapping from a CSV file."""
+        """Load volume-to-text mapping from a CSV file."""
         df = pd.read_csv(reports)
         return {
-            row['VolumeName']: (row['Findings_EN'] or "", row['Impressions_EN'] or "")
+            row['VolumeName']: (str(row['Findings_EN']) or "", str(row['Impressions_EN']) or "")
             for _, row in df.iterrows()
         }
 
     def _prepare_samples(self):
         """Prepare the list of samples from the data folder."""
         samples = []
-
-        # Read labels once outside the loop
         labels_df = pd.read_csv(self.labels)
         label_cols = list(labels_df.columns[1:])
         labels_df['one_hot_labels'] = list(labels_df[label_cols].values)

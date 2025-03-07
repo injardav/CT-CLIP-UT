@@ -1,12 +1,9 @@
 import os
-import glob
 import torch
 import pandas as pd
-import numpy as np
 import zipfile
 from torch.utils.data import Dataset
-from functools import partial
-
+from utils.preprocess import process_file
 
 class TrainDataset(Dataset):
     def __init__(self, data_folder, reports, metadata, num_samples=5000):
@@ -20,15 +17,15 @@ class TrainDataset(Dataset):
             num_samples (int, optional): Number of samples to limit the dataset. Defaults to 5000.
         """
         self.data_folder = data_folder
-        self.metadata = metadata
-        self.accession_to_text = self._load_accession_text(reports)
+        self.metadata_df = pd.read_csv(metadata)
+        self.observations = self._load_observations(reports)
         self.samples = self._prepare_samples()
         
         if num_samples < len(self.samples):
             self.samples = self.samples[:num_samples]
 
-    def _load_accession_text(self, reports):
-        """Load accession-to-text mapping from a CSV file."""
+    def _load_observations(self, reports):
+        """Load volume-to-text mapping from a CSV file."""
         df = pd.read_csv(reports)
         return {
             row['VolumeName']: (str(row['Findings_EN']) or "", str(row['Impressions_EN']) or "")
@@ -38,26 +35,31 @@ class TrainDataset(Dataset):
     def _prepare_samples(self):
         """Prepare the list of samples from the data folder."""
         samples = []
-        for patient_folder in glob.glob(os.path.join(self.data_folder, '*')):
-            for accession_folder in glob.glob(os.path.join(patient_folder, '*')):
-                for nii_file in glob.glob(os.path.join(accession_folder, '*.npz')):
-                    accession_number = os.path.basename(nii_file).replace('.npz', '.nii.gz')
-                    if accession_number not in self.accession_to_text:
+
+        # Traverse directory tree, find scans and fetch observations
+        for root, _, files in os.walk(self.data_folder):
+            for file in files:
+                if file.endswith(".nii.gz"):
+
+                    if file not in self.observations:
                         continue
                     
-                    findings, impressions = self.accession_to_text[accession_number]
-                    input_text = findings + impressions
-                    samples.append((nii_file, input_text))
+                    file_path = os.path.join(root, file)
+                    findings, impressions = self.observations[file]
+                    samples.append((file_path, findings + impressions, file))
 
         return samples
 
-    def _nii_img_to_tensor(self, path):
-        """Load a preprocessed .npz file as a tensor."""
+    def __len__(self):
+        return len(self.samples)
+
+    def _preprocess_scan(self, path, name):
+        """Preprocess a raw NIfTI CT scan to tensor."""
         if not os.path.exists(path):
             raise FileNotFoundError(f"File not found: {path}")
 
         try:
-            img_data = np.load(path)['arr_0']
+            img_data = process_file(path, name, self.metadata_df)
         except zipfile.BadZipFile:
             raise RuntimeError(f"Corrupted file: {path}")
         except Exception as e:
@@ -65,15 +67,12 @@ class TrainDataset(Dataset):
 
         return torch.tensor(img_data, dtype=torch.float32).unsqueeze(0)
 
-    def __len__(self):
-        return len(self.samples)
-
     def __getitem__(self, index):
-        nii_file, input_text = self.samples[index]
-        image_tensor = self._nii_img_to_tensor(nii_file)
-        input_text = input_text.replace('"', '')  
-        input_text = input_text.replace('\'', '')  
-        input_text = input_text.replace('(', '')  
-        input_text = input_text.replace(')', '').strip()
+        path, observations, name = self.samples[index]
+        tensor = self._preprocess_scan(path, name)
+        observations = observations.replace('"', '')  
+        observations = observations.replace('\'', '')  
+        observations = observations.replace('(', '')  
+        observations = observations.replace(')', '').strip()
 
-        return image_tensor, input_text
+        return tensor, observations

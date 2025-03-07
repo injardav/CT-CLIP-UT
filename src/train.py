@@ -65,7 +65,7 @@ trainer = CTClipTrainer(
     clip,
     train_reports = "/mnt/ct_clip_data/reports/train_reports.csv",
     valid_reports = "/mnt/ct_clip_data/reports/valid_reports.csv",
-    data_train = "/mnt/ct_clip_data/train_preprocessed",
+    data_train = "/mnt/ct_clip_data/data_volumes/dataset/train",
     data_valid = "/mnt/ct_clip_data/data_volumes/dataset/valid",
     valid_labels = "/mnt/ct_clip_data/labels/valid_labels.csv",
     train_metadata = "/mnt/ct_clip_data/metadata/train_metadata.csv",

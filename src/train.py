@@ -53,11 +53,13 @@ vit_encoder = CTViT(
 
 clip = CTCLIP(
     text_encoder = text_encoder,
-    image_encoder = swin_encoder,
+    image_encoder = vit_encoder,
     dim_text = dim_text,
-    dim_image = swin_dim_image,
+    dim_image = vit_dim_image,
     dim_latent = dim_latent
 )
+
+clip.load("/mnt/ct_clip/models/CT-CLIP_v2.pt", strict=False)
 
 trainer = CTClipTrainer(
     clip,

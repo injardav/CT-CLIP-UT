@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from pathlib import Path
 from einops import rearrange, pack
 from einops.layers.torch import Rearrange
 from vector_quantize_pytorch import VectorQuantize
@@ -54,6 +55,26 @@ class CTViT(nn.Module):
         self.enc_spatial_transformer = Transformer(depth=spatial_depth, **transformer_kwargs)
         self.enc_temporal_transformer = Transformer(depth=temporal_depth, **transformer_kwargs)
         self.vq = VectorQuantize(dim=dim, codebook_size=codebook_size, use_cosine_sim=True)
+
+    def load_state_dict(self, *args, **kwargs):
+        """
+        Load a state dictionary into the model.
+        """
+        return super().load_state_dict(*args, **kwargs)
+
+    def load(self, path, strict=False):
+        """
+        Load a saved model state from a file.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Model state file not found at: {path}")
+        try:
+            state_dict = torch.load(str(path))
+            self.load_state_dict(state_dict, strict)
+            print(f"Successfully loaded state dictionary from: {path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load state dictionary from {path}: {e}")
 
     def encode(self, tokens):
         attn_bias = self.spatial_rel_pos_bias(self.patch_height, self.patch_width, device=tokens.device)

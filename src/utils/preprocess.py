@@ -91,12 +91,12 @@ def process_file(file_path, file_name, metadata_df):
     current_spacing = (z_spacing, xy_spacing, xy_spacing)
     target_spacing = (target_z_spacing, target_x_spacing, target_y_spacing)
 
-    hu_min, hu_max = -1000, 1000
-    img_data = np.clip(img_data, hu_min, hu_max)
-    img_data = img_data / 1000.0  # roughly in [-1, 1]
-    # hu_min, hu_max = -1000, 200
+    # hu_min, hu_max = -1000, 1000
     # img_data = np.clip(img_data, hu_min, hu_max)
-    # img_data = (img_data + 400) / 600.0
+    # img_data = img_data / 1000.0  # roughly in [-1, 1]
+    hu_min, hu_max = -1000, 200
+    img_data = np.clip(img_data, hu_min, hu_max)
+    img_data = (img_data + 400) / 600.0
 
     img_data = img_data.astype(np.float32)
 

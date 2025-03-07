@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import torch
 import itertools
@@ -327,10 +328,14 @@ class CTClipTrainer(nn.Module):
         """
         Runs distributed training.
         """
+        start_time = time.time()
         save_at = len(self.train_dl) // self.num_save_split
         self.maybe_print("Training started")
 
+        epoch_durations = []
+
         for epoch in range(1, self.num_epochs + 1):
+            epoch_start = time.time()
             self.maybe_print(f"\nStarting Epoch {epoch}/{self.num_epochs}")
             self.train_sampler.set_epoch(epoch)
             total_loss = 0.0
@@ -354,7 +359,21 @@ class CTClipTrainer(nn.Module):
 
             avg_epoch_loss = self.avg_device_loss(total_loss / len(self.train_dl))
             self.train_losses.setdefault("epochs", []).append(avg_epoch_loss)
+
+            epoch_time = time.time() - epoch_start
+            epoch_durations.append(epoch_time)
+
             self.maybe_print(f"Epoch {epoch} completed. Average Loss: {avg_epoch_loss:.6f}")
+            self.maybe_print(f"Time taken for Epoch {epoch}: {str(timedelta(seconds=epoch_time))}")
+            
+            eval_start = time.time()
             self.evaluate(epoch)
+            eval_time = time.time() - eval_start
+            self.maybe_print(f"Time taken for evaluation: {str(timedelta(seconds=eval_time))}")
+
+        total_time = time.time() - start_time
+        avg_epoch_time = sum(epoch_durations) / len(epoch_durations)
 
         self.maybe_print("Training completed")
+        self.maybe_print(f"Total Training Time: {str(timedelta(seconds=total_time))}")
+        self.maybe_print(f"Average Epoch Duration: {str(timedelta(seconds=avg_epoch_time))}")

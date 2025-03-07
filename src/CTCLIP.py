@@ -42,7 +42,7 @@ class GatherWithGrad(torch.autograd.Function):
 
 
 class CTCLIP(nn.Module):
-    def __init__(self, *, text_encoder, image_encoder, dim_text, dim_image, dim_latent, temperature_init=0.07):
+    def __init__(self, *, text_encoder, image_encoder, dim_text, dim_image, dim_latent, temperature_init=1.0):
         """
         CTCLIP: Contrastive Text and Image Pretraining Model.
 
@@ -57,33 +57,32 @@ class CTCLIP(nn.Module):
         super().__init__()
 
         # Encoders
-        self.text_encoder = text_encoder
-        self.image_encoder = image_encoder
+        self.text_transformer = text_encoder
+        self.visual_transformer = image_encoder
 
         # Projection layers
         self.to_text_latent = nn.Linear(dim_text, dim_latent, bias=False)
-        self.to_image_latent = nn.Linear(dim_image, dim_latent, bias=False)
+        self.to_visual_latent = nn.Linear(dim_image, dim_latent, bias=False)
 
         # Temperature parameter
-        self.log_temperature = nn.Parameter(torch.tensor(math.log(temperature_init), dtype=torch.float))
+        self.temperature = nn.Parameter(torch.tensor(temperature_init))
 
-    def load_state_dict(self, state_dict, strict=False):
+    def load_state_dict(self, *args, **kwargs):
         """
         Load a state dictionary into the model.
         """
-        return super().load_state_dict(state_dict, strict=strict)
+        return super().load_state_dict(*args, **kwargs)
 
-    def load(self, path):
+    def load(self, path, strict=False):
         """
         Load a saved model state from a file.
         """
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Model state file not found at: {path}")
-        
         try:
-            state_dict = torch.load(str(path), map_location="cpu")  # Map to CPU to avoid device mismatch issues
-            self.load_state_dict(state_dict, strict=False)
+            state_dict = torch.load(str(path))
+            self.load_state_dict(state_dict, strict)
             print(f"Successfully loaded state dictionary from: {path}")
         except Exception as e:
             raise RuntimeError(f"Failed to load state dictionary from {path}: {e}")
@@ -102,20 +101,20 @@ class CTCLIP(nn.Module):
         maybe_print = print if self.accelerator.is_main_process else lambda *args, **kwargs: None
 
         # --- Encoding ---
-        text_output = self.text_encoder(**text_inputs).last_hidden_state[:, 0, :]
+        text_output = self.text_transformer(**text_inputs).last_hidden_state[:, 0, :]
 
         # swin encoder approach
-        image_output = self.image_encoder(image_inputs)[-1]
-        image_output = image_output.mean(dim=[2, 3, 4])
+        # image_output = self.visual_transformer(image_inputs)[-1]
+        # image_output = image_output.mean(dim=[2, 3, 4])
 
         # vit encoder approach
-        # image_output = self.image_encoder(image_inputs)
-        # image_output = image_output.mean(dim=1)
-        # image_output = image_output.view(image_output.shape[0], -1)
+        image_output = self.visual_transformer(image_inputs)
+        image_output = image_output.mean(dim=1)
+        image_output = image_output.view(image_output.shape[0], -1)
 
         # --- Projection ---
         text_latents = self.to_text_latent(text_output)
-        image_latents = self.to_image_latent(image_output)
+        image_latents = self.to_visual_latent(image_output)
 
         # --- Normalization ---
         text_latents = text_latents / text_latents.norm(dim=-1, keepdim=True)
@@ -126,6 +125,6 @@ class CTCLIP(nn.Module):
         image_latents = self.gather_features(image_latents)
 
         # --- Similarity Matrix ---
-        sim_matrix = image_latents @ text_latents.t() / self.log_temperature.exp()
+        sim_matrix = image_latents @ text_latents.t() / self.temperature.exp()
 
-        return sim_matrix, image_latents, text_latents, self.log_temperature.exp()
+        return sim_matrix, image_latents, text_latents, self.temperature.exp()

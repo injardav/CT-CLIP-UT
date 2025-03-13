@@ -93,7 +93,7 @@ class CTCLIP(nn.Module):
         """
         return GatherWithGrad.apply(features)
 
-    def forward(self, text_inputs, image_inputs, inference=False):
+    def forward(self, text_inputs, image_inputs):
         """
         Forward pass for CTCLIP with spatial token contrast.
         """
@@ -108,10 +108,8 @@ class CTCLIP(nn.Module):
         # image_output = image_output.mean(dim=[2, 3, 4])
 
         # vit encoder approach
-        image_output, attention_weights = self.visual_transformer(image_inputs)
-        if inference:
-            return image_output, attention_weights
-        image_output = image_output.mean(dim=1)
+        image_tokens, attention_weights = self.visual_transformer(image_inputs)
+        image_output = image_tokens.mean(dim=1)
         image_output = image_output.view(image_output.shape[0], -1)
 
         # --- Projection ---
@@ -122,11 +120,11 @@ class CTCLIP(nn.Module):
         text_latents = text_latents / text_latents.norm(dim=-1, keepdim=True)
         image_latents = image_latents / image_latents.norm(dim=-1, keepdim=True)
 
-        # --- Gather across devices (if applicable) ---
+        # --- Gather across devices ---
         text_latents = self.gather_features(text_latents)
         image_latents = self.gather_features(image_latents)
 
         # --- Similarity Matrix ---
         sim_matrix = image_latents @ text_latents.t() / self.temperature.exp()
 
-        return sim_matrix, image_latents, text_latents, self.temperature.exp()
+        return sim_matrix, image_latents, text_latents, self.temperature.exp(), image_tokens, attention_weights

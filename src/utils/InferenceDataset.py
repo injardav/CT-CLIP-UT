@@ -78,9 +78,10 @@ class InferenceDataset(Dataset):
     def __getitem__(self, index):
         path, observations, onehotlabels, name = self.samples[index]
         tensor = self._preprocess_scan(path, name)
+        name = name.replace(".nii.gz", "")
         observations = observations.replace('"', '')  
         observations = observations.replace('\'', '')  
         observations = observations.replace('(', '')  
         observations = observations.replace(')', '').strip()
 
-        return tensor, observations, onehotlabels, name
+        return tensor, observations, onehotlabels, name, path

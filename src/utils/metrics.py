@@ -78,7 +78,7 @@ def save_metrics(metrics_list, pathologies, results_path):
             )
             f.write(table_str + "\n\n")
 
-def plot_precision_recall_curve(targets, predictions, pathologies, results_path, epoch):
+def plot_precision_recall_curve(targets, predictions, pathologies, results_path, epoch=1):
     """Generate and save a single precision-recall curve plot for all pathologies."""
     results_path = results_path / "precision_recall_curves"
     results_path.mkdir(parents=True, exist_ok=True)
@@ -99,7 +99,7 @@ def plot_precision_recall_curve(targets, predictions, pathologies, results_path,
     plt.savefig(results_path / f"epoch_{epoch}_precision_recall_curves.png")
     plt.close()
 
-def plot_roc_curve(targets, predictions, pathologies, results_path, epoch):
+def plot_roc_curve(targets, predictions, pathologies, results_path, epoch=1):
     """Generate and save a single ROC curve plot for all pathologies."""
     results_path = results_path / "roc_curves"
     results_path.mkdir(parents=True, exist_ok=True)
@@ -122,7 +122,7 @@ def plot_roc_curve(targets, predictions, pathologies, results_path, epoch):
     plt.savefig(results_path / f"epoch_{epoch}_roc_curves.png")
     plt.close()
 
-def plot_per_class_f1(metrics, pathologies, results_path, epoch):
+def plot_per_class_f1(metrics, pathologies, results_path, epoch=1):
     """Generate and save a bar chart of per-class F1 scores."""
     results_path = results_path / "f1_scores"
     results_path.mkdir(parents=True, exist_ok=True)
@@ -207,14 +207,13 @@ def plot_all_metrics(metrics_history, results_path):
     plt.show()
     plt.close()
 
-def plot_training_progress(train_losses, valid_losses, valid_accuracies, results_path):
+def plot_training_progress(train_losses, valid_losses, results_path):
     """
     Plots training loss and validation accuracy side-by-side across epochs.
 
     Parameters:
     - train_losses: Dictionary with keys 'steps' and 'epochs', each containing lists of loss values.
     - valid_losses: List of averaged validation losses.
-    - valid_accuracies: List of averaged validation accuracy values.
     - results_path: Path to save the output plot.
     """
     results_path = Path(results_path)
@@ -243,7 +242,7 @@ def plot_training_progress(train_losses, valid_losses, valid_accuracies, results
     ax[0].legend()
     ax[0].grid(True, linestyle="--", alpha=0.5)
 
-    # --- Plot Validation Loss (Middle) ---
+    # --- Plot Validation Loss (Right) ---
     ax[1].plot(epochs, valid_losses, color="tab:orange", marker='o', linestyle='-')
     ax[1].set_xlabel("Epoch")
     ax[1].set_ylabel("Contrastive Loss")
@@ -251,15 +250,6 @@ def plot_training_progress(train_losses, valid_losses, valid_accuracies, results
     ax[1].set_xticks(epochs)
     ax[1].set_xticklabels([str(epoch) for epoch in epochs])
     ax[1].grid(True, linestyle="--", alpha=0.5)
-
-    # --- Plot Validation Accuracy (Right) ---
-    ax[2].plot(epochs, valid_accuracies, color="tab:orange", marker='o', linestyle='-')
-    ax[2].set_xlabel("Epoch")
-    ax[2].set_ylabel("Mean Average Precision")
-    ax[2].set_title("Validation Accuracy")
-    ax[2].set_xticks(epochs)
-    ax[2].set_xticklabels([str(epoch) for epoch in epochs])
-    ax[2].grid(True, linestyle="--", alpha=0.5)
 
     plt.suptitle("Training Progress", fontsize=14, fontweight="bold")
     plt.savefig(results_path / "training_progress.png")

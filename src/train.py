@@ -17,27 +17,27 @@ torch.autograd.set_detect_anomaly(False)
 text_encoder = BertModel.from_pretrained("microsoft/BiomedVLP-CXR-BERT-specialized")
 dim_latent = 512
 dim_text = 768
-swin_dim_image = 384
 vit_dim_image = 294912
+# swin_dim_image = 384
 
-swin_encoder = SwinTransformer(
-    in_chans=1,
-    embed_dim=24,
-    window_size=ensure_tuple_rep(7, 3),
-    patch_size=ensure_tuple_rep(3, 3),
-    depths=(2, 2, 2, 2),
-    num_heads=(3, 6, 12, 24),
-    mlp_ratio=4.0,
-    qkv_bias=True,
-    drop_rate=0.0,
-    attn_drop_rate=0.0,
-    drop_path_rate=0.0,
-    norm_layer=nn.LayerNorm,
-    use_checkpoint=True,
-    spatial_dims=3,
-    downsample='merging',
-    use_v2=True
-)
+# swin_encoder = SwinTransformer(
+#     in_chans=1,
+#     embed_dim=24,
+#     window_size=ensure_tuple_rep(7, 3),
+#     patch_size=ensure_tuple_rep(3, 3),
+#     depths=(2, 2, 2, 2),
+#     num_heads=(3, 6, 12, 24),
+#     mlp_ratio=4.0,
+#     qkv_bias=True,
+#     drop_rate=0.0,
+#     attn_drop_rate=0.0,
+#     drop_path_rate=0.0,
+#     norm_layer=nn.LayerNorm,
+#     use_checkpoint=True,
+#     spatial_dims=3,
+#     downsample='merging',
+#     use_v2=True
+# )
 
 vit_encoder = CTViT(
     dim = 512,
@@ -70,7 +70,7 @@ trainer = CTClipTrainer(
     valid_labels = "/mnt/ct_clip/CT-CLIP-UT/labels/valid_labels.csv",
     train_metadata = "/mnt/ct_clip/CT-CLIP-UT/metadata/train_metadata.csv",
     valid_metadata = "/mnt/ct_clip/CT-CLIP-UT/metadata/valid_metadata.csv",
-    results_folder = "/mnt/ct_clip/CT-CLIP-UT/src/results",
+    results_folder = "/mnt/ct_clip/CT-CLIP-UT/src/results/train",
     batch_size = 1,
     num_workers = 4,
     num_epochs = 15,

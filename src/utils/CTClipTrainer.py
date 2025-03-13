@@ -1,11 +1,8 @@
 import time
-import numpy as np
 import torch
-import itertools
 import torch.nn.functional as F
 
 from pathlib import Path
-from shutil import rmtree
 from datetime import timedelta, datetime
 
 from torch import nn
@@ -120,8 +117,7 @@ class CTClipTrainer(nn.Module):
         self.metrics = []
         self.train_losses = {}
         self.valid_losses = []
-        self.valid_accuracies = []
-        self.best_score = 0
+        self.best_score = float('inf')
 
         if self.accelerator.process_index == 0:
             # Create correct results directory structure dynamically
@@ -166,7 +162,9 @@ class CTClipTrainer(nn.Module):
         return gathered_losses.mean().item()
 
     def loss_function(self, sim_matrix, targets=None):
-        """Compute contrastive loss using similarity matrix."""
+        """
+        Compute contrastive loss using similarity matrix.
+        """
         if targets is None:
             targets = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
 
@@ -175,28 +173,11 @@ class CTClipTrainer(nn.Module):
         loss = (loss_i2t + loss_t2i) / 2
 
         return loss
-    
-    def validate_prompts(self, image_latents, text_latents, temp):
-        """Compute evaluation loss based on both given text prompts."""
-        text_latents_present = text_latents[::2]  # Shape: [B, embed_dim]
-        text_latents_absent = text_latents[1::2]  # Shape: [B, embed_dim]
-
-        # Compute separate similarity matrices for present and absent prompts.
-        sim_matrix_present = image_latents @ text_latents_present.t() / temp  # Shape: [B, B]
-        sim_matrix_absent  = image_latents @ text_latents_absent.t()  / temp  # Shape: [B, B]
-
-        # Compute targets based on image_latents
-        # targets = torch.arange(image_latents.shape[0], device=image_latents.device)
-
-        # Compute cross-entropy losses in both directions for each prompt type.
-        # loss_present = self.loss_function(sim_matrix_present, targets)
-        # loss_absent = self.loss_function(sim_matrix_absent, targets)
-        # loss = (loss_present + loss_absent) / 2
-
-        return sim_matrix_present, sim_matrix_absent
 
     def train_step(self, batch):
-        """Performs a single training step."""
+        """
+        Performs a single training step.
+        """
         self.model.train()
         self.optim.zero_grad()
         
@@ -210,7 +191,7 @@ class CTClipTrainer(nn.Module):
             max_length=512
         ).to(self.accelerator.device)
 
-        sim_matrix, _, _, _ = self.model(text_tokens, images)
+        sim_matrix, *_ = self.model(text_tokens, images)
         loss = self.loss_function(sim_matrix)
         self.accelerator.backward(loss)
 
@@ -224,10 +205,9 @@ class CTClipTrainer(nn.Module):
 
     def evaluate(self, epoch):
         """
-        Evaluates the model, computes combined loss, and logs results.
+        Evaluates the model, computes combined loss, and plots results.
         """
         self.model.eval()
-        predictions, targets = [], []
         total_val_loss = 0.0
 
         self.maybe_print(f"Evaluating epoch {epoch}")
@@ -245,82 +225,27 @@ class CTClipTrainer(nn.Module):
             ).to(self.accelerator.device)
 
             # Forward pass with original text for true validation loss
-            sim_matrix, _, _, _ = self.model(text_tokens, images)
+            sim_matrix, *_ = self.model(text_tokens, images)
             val_loss = self.loss_function(sim_matrix)
             total_val_loss += val_loss.item()
-
-            for j, pathology in enumerate(PATHOLOGIES):
-                text = [f"There is {pathology}.", f"There is no {pathology}."]
-
-                # Tokenize the text prompts
-                text_tokens = self.tokenizer(
-                    text,
-                    return_tensors="pt",
-                    padding="max_length",
-                    truncation=True,
-                    max_length=512
-                ).to(self.accelerator.device)
-
-                # Forward pass of text prompts for pathology predictions
-                _, image_latents, text_latents, temp = self.model(text_tokens, images)
-                sim_matrix_present, sim_matrix_absent = self.validate_prompts(image_latents, text_latents, temp)
-
-                # Extract diagonal elements to get predictions for each sample
-                present_scores = torch.diag(sim_matrix_present)  # Present prompt scores
-                absent_scores = torch.diag(sim_matrix_absent)    # Absent prompt scores
-
-                # Apply softmax to the extracted diagonal scores, compute and save predictions
-                probabilities = torch.nn.functional.softmax(torch.stack([present_scores, absent_scores], dim=1), dim=1)
-                present_scores, absent_scores = probabilities[:, 0], probabilities[:, 1]
-                predicted_class = (present_scores > absent_scores).long()
-                device_prediction = predicted_class[self.accelerator.process_index]
-                predicted_labels[j] = device_prediction.item()
-
-            predictions.append(predicted_labels)
-            targets.append(labels)
 
         # Compute average validation loss
         avg_val_loss = self.avg_device_loss(total_val_loss / len(self.valid_dl))
         self.valid_losses.append(avg_val_loss)
+        self.maybe_print(f"Epoch {epoch} - Validation Loss: {avg_val_loss:.4f}")
 
-        # Convert predictions and targets to tensors
-        predictions = torch.stack(predictions)
-        targets = torch.stack(targets)
-
-        # Gather across devices
-        predictions, targets = self.accelerator.gather_for_metrics((predictions, targets))
-        targets = targets.squeeze(dim=1).cpu().numpy()
-        predictions = predictions.cpu().numpy()
-
-        # Compute evaluation metrics
+        # Check for best score and plot losses
         if self.accelerator.is_main_process:
-            self.maybe_print(f"Computing metrics at epoch {epoch}")
-            metrics = calculate_metrics(predictions, targets, PATHOLOGIES)
-            self.valid_accuracies.append(metrics["mAP"])
-            self.metrics.append(metrics)
-
-            # Save metrics and plots
-            save_metrics(self.metrics, PATHOLOGIES, self.results_folder)
-            plot_precision_recall_curve(targets, predictions, PATHOLOGIES, self.results_folder, epoch)
-            plot_roc_curve(targets, predictions, PATHOLOGIES, self.results_folder, epoch)
-            plot_per_class_f1(metrics, PATHOLOGIES, self.results_folder, epoch)
-            plot_all_metrics(self.metrics, self.results_folder)
-
-            self.maybe_print(f"Epoch {epoch} - Validation Loss: {avg_val_loss:.4f}")
-
-            # Check for best score
-            validation_metric = metrics["mAP"]
-            if epoch == 0 or (validation_metric > self.best_score and self.save_best_model):
-                self.best_score = validation_metric
+            if epoch == 0 or (avg_val_loss < self.best_score and self.save_best_model):
+                self.best_score = avg_val_loss
                 self.save_model(
                     "best_checkpoint.pt",
-                    f"New best model saved at epoch {epoch}, with mean average precision {validation_metric:.4f}"
+                    f"New best model saved at epoch {epoch}, with average validation loss {avg_val_loss:.4f}"
                 )
 
             plot_training_progress(
                 self.train_losses,
                 self.valid_losses,
-                self.valid_accuracies,
                 self.results_folder
             )
 

@@ -5,7 +5,7 @@ from monai.utils import ensure_tuple_rep
 from CTCLIP import CTCLIP
 from utils.CTClipInference import CTClipInference
 from utils.ctvit import CTViT
-from transformers import BertModel
+from transformers import BertTokenizer, BertModel
 from transformers.utils import logging
 from torch import nn
 
@@ -14,7 +14,10 @@ logging.set_verbosity_error()
 torch.set_printoptions(profile="default")
 torch.autograd.set_detect_anomaly(False)
 
+tokenizer = BertTokenizer.from_pretrained('microsoft/BiomedVLP-CXR-BERT-specialized', do_lower_case=True)
 text_encoder = BertModel.from_pretrained("microsoft/BiomedVLP-CXR-BERT-specialized")
+text_encoder.resize_token_embeddings(len(tokenizer))
+
 dim_latent = 512
 dim_text = 768
 vit_dim_image = 294912
@@ -60,7 +63,7 @@ clip = CTCLIP(
     dim_latent = dim_latent
 )
 
-clip.load("/mnt/ct_clip/models/CT-CLIP_v2.pt", strict=False)
+clip.load("/mnt/ct_clip/models/CT-CLIP_v2.pt")
 
 inference = CTClipInference(
     clip,
@@ -71,7 +74,8 @@ inference = CTClipInference(
     results_folder = "/mnt/ct_clip/CT-CLIP-UT/src/results/valid",
     batch_size = 1,
     num_workers = 4,
-    num_valid_samples = 8,
+    num_valid_samples = 1,
+    zero_shot = False,
     visualize = True
 )
 

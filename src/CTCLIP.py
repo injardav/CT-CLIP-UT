@@ -81,7 +81,7 @@ class CTCLIP(nn.Module):
         if not path.exists():
             raise FileNotFoundError(f"Model state file not found at: {path}")
         try:
-            state_dict = torch.load(str(path))
+            state_dict = torch.load(str(path), map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
             self.load_state_dict(state_dict, strict)
             print(f"Successfully loaded state dictionary from: {path}")
         except Exception as e:
@@ -91,7 +91,10 @@ class CTCLIP(nn.Module):
         """
         Gather features across devices while maintaining gradients.
         """
-        return GatherWithGrad.apply(features)
+        if torch.distributed.is_initialized():
+            return GatherWithGrad.apply(features)
+        else:
+            return features
 
     def forward(self, text_inputs, image_inputs):
         """
@@ -125,6 +128,6 @@ class CTCLIP(nn.Module):
         image_latents = self.gather_features(image_latents)
 
         # --- Similarity Matrix ---
-        sim_matrix = image_latents @ text_latents.t() / self.temperature.exp()
+        sim_matrix = image_latents @ text_latents.t() * self.temperature.exp()
 
         return sim_matrix, image_latents, text_latents, self.temperature.exp(), image_tokens, attention_weights

@@ -4,11 +4,13 @@ import numpy as np
 import nibabel as nib
 import torch.nn.functional as F
 import torch.distributed as dist
+from collections import Counter
 from datetime import timedelta
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import scipy.stats as stats
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from CTCLIP import CTCLIP
@@ -46,7 +48,7 @@ class Visualizations():
         tokenizer: BertTokenizer,
         results_folder: Path
     ):
-        self.model = model
+        self.model = model.module if hasattr(model, "module") else model
         self.accelerator = accelerator
         self.single_dataloader = single_dataloader
         self.dist_dataloader = dist_dataloader
@@ -56,6 +58,9 @@ class Visualizations():
 
         self.maybe_print = print if self.accelerator.is_main_process else lambda *args, **kwargs: None
         self.saved_outputs = {}
+
+        self.rank = self.accelerator.process_index
+        self.world_size = self.accelerator.num_processes
 
 
     def _results_subdirectory(self, visualization_name):
@@ -94,7 +99,7 @@ class Visualizations():
         """
         Create and register forward/backward hooks to capture spatial features and gradients.
         """
-        spatial_attention_layer = self.model.module.visual_transformer.enc_spatial_transformer.layers[-1][1]
+        spatial_attention_layer = self.model.visual_transformer.enc_spatial_transformer
 
         spatial_attention_layer.register_forward_hook(
             lambda module, input, output: self.saved_outputs.update({"spatial_features": output[0]})
@@ -173,14 +178,14 @@ class Visualizations():
         plt.close(fig)
 
 
-    def visualize_attention(self, images, text_tokens, scan_name, original_scan_path):
+    def visualize_attention(self, image, text_tokens, scan_name, original_scan_path):
         """
         original_image torch.Size([1, 1, 240, 480, 480])
         image_tokens torch.Size([1, 24, 24, 24, 512])
         attention_weights torch.Size([24, 8, 576, 576])
         """
         with torch.no_grad():
-            *_, image_tokens, attention_weights = self.model(text_tokens, images)
+            *_, image_tokens, attention_weights = self.model(text_tokens, image)
         
         original_image = self._read_nii_data(original_scan_path)
         image_tokens = image_tokens.norm(dim=-1)           # L2 norm over features
@@ -196,31 +201,33 @@ class Visualizations():
                             align_corners=False).squeeze(0).squeeze(0)
         importance_map = importance_map.detach().cpu().numpy()
 
-        if self.accelerator.process_index == 0:
+        if self.accelerator.is_main_process:
             results_dir = self._results_subdirectory("attention") / f"{scan_name}.gif"
-            extra_info = "Text: 'lung'\nThreshold: 0.85"
-            self.visualize_overlay(original_image, importance_map, scan_name, "Attention", results_dir, threshold=0.85, extra_info=extra_info)
+            extra_info = "Threshold: 0.8"
+            self.visualize_overlay(original_image, importance_map, scan_name, "Attention", results_dir, threshold=0.8, extra_info=extra_info)
 
 
-    def visualize_grad_cam(self, images, text_tokens, scan_name, original_scan_path):
+    def visualize_grad_cam(self, image, text_tokens, scan_name, original_scan_path):
         """
         Use spatial feature maps and gradients obtained from hooks to construct class activation maps (cams).
         Visualize these cams by overlaying them on top of the original CT scan.
         """
         with torch.enable_grad():
-            sim_matrix, *_ = self.model(text_tokens, images)
-            # self._loss_function(sim_matrix).backward()
-            torch.diag(sim_matrix).sum().backward()
+            sim_matrix, *_ = self.model(text_tokens, image)
+            sim_matrix[self.rank, self.rank].backward()
 
-        original_image = self._read_nii_data(original_scan_path).squeeze(0)                                                          # torch.Size([1, 1, 240, 480, 480])
-        spatial_features = self.saved_outputs.get("spatial_features")                                                                # torch.Size([24, 576, 512])
-        spatial_gradients = self.saved_outputs.get("spatial_gradients")                                                              # torch.Size([24, 576, 512])
+        original_image = self._read_nii_data(original_scan_path).squeeze(0)                                                     # torch.Size([1, 1, 240, 480, 480])
+        spatial_features = self.saved_outputs.get("spatial_features")                                                           # torch.Size([24, 576, 512])
+        spatial_gradients = self.saved_outputs.get("spatial_gradients")                                                         # torch.Size([24, 576, 512])
         
-        spatial_gradients = spatial_gradients.abs().mean(dim=-1)                                                                # Shape: [24, 576]
-        spatial_gradients = (spatial_gradients - spatial_gradients.min()) / (spatial_gradients.max() - spatial_gradients.min())
-        cam = (spatial_gradients.unsqueeze(-1) * spatial_features).sum(dim=-1)                                                  # Shape: [24, 576]
-        cam = cam.view(24, 24, 24)                                                                                              # Shape: (Depth, Height, Width)
+        spatial_features = spatial_features.to(torch.float64)
+        spatial_gradients = spatial_gradients.to(torch.float64)
+
+        spatial_gradients = spatial_gradients.mean(dim=1, keepdim=True)
+        
+        cam = (spatial_gradients * spatial_features).sum(dim=-1)
         cam = cam.relu()
+        cam = cam.view(24, 24, 24)
 
         cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0),
                             size=original_image.shape,
@@ -229,84 +236,69 @@ class Visualizations():
         cam = cam.detach().cpu().numpy()
 
         if self.accelerator.process_index == 0:
-            results_dir = self._results_subdirectory("grad_cam") / f"{scan_name}.gif"
-            extra_info = "Text: 'lung'\nThreshold: 0.0\nBackprop: diagonal sum"
-            self.visualize_overlay(original_image, cam, scan_name, "Grad-CAM", results_dir, extra_info=extra_info)
+            results_dir = self._results_subdirectory("grad_cam")
+            extra_info = "Text: original\nThreshold: 0.0\nBackprop: rank sim score\nGrad target: input"
+            self.visualize_overlay(original_image, cam, scan_name, "Grad-CAM", results_dir / f"{scan_name}.gif", threshold=0.0, extra_info=extra_info)
 
 
-    def visualize_occlusion_sensitivity(self, images, text_tokens, scan_name, original_scan_path, patch_size=(10,20,20), stride=(5,10,10)):
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        
+    def visualize_occlusion_sensitivity(self, image, text_tokens, scan_name, original_scan_path, patch_size=(40,80,80), stride=(40,80,80)):
+        black_value = image.max().item()
         original_image = self._read_nii_data(original_scan_path)
-        _, _, D, H, W = images.shape
+        _, _, D, H, W = image.shape
         heatmap = np.zeros((D, H, W))
+        importance_values = []
+        iteration_count = 0
 
         # Compute original similarity score (before occlusion)
         with torch.no_grad():
-            original_sim_matrix, *_ = self.model(text_tokens, images)
-            original_score = torch.diag(original_sim_matrix).sum().item()
+            original_sim_matrix, *_ = self.model(text_tokens, image)
+            original_score = original_sim_matrix[self.rank, self.rank].item()
 
         # Divide Depth (D) among GPUs
         # Each GPU is responsible for a subset of the depth slices (D)
-        d_start = rank * (D // world_size)
-        d_end = (rank + 1) * (D // world_size) if rank != world_size - 1 else D  # Handle last GPU case
-
-        print(f"GPU {rank}: Processing {scan_name} slices {d_start} to {d_end}")
+        depth_splits = torch.chunk(torch.arange(D), self.world_size)
+        d_start, d_end = depth_splits[self.rank][0].item(), min(depth_splits[self.rank][-1].item() + 1, D)
 
         # Iterate through the assigned depth range for this GPU
-        for d in range(d_start, d_end - patch_size[0] + 1, stride[0]):
-            for h in range(0, H - patch_size[1] + 1, stride[1]):
-                for w in range(0, W - patch_size[2] + 1, stride[2]):
-                    occluded_images = images.clone()
-                    occluded_images[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = 0  # Occlude region
-                    
+        for d in range(d_start, min(d_end, D - patch_size[0] + 1), stride[0]):
+            for h in range(0, min(H, H - patch_size[1] + 1), stride[1]):
+                for w in range(0, min(W, W - patch_size[2] + 1), stride[2]):
+                    occluded_image = image.clone().detach()
+                    occluded_image[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = black_value
+
                     with torch.no_grad():
-                        occluded_sim_matrix, *_ = self.model(text_tokens, occluded_images)
-                        occluded_score = torch.diag(occluded_sim_matrix).sum().item()
+                        occluded_sim_matrix, *_ = self.model(text_tokens, occluded_image)
+                        occluded_score = occluded_sim_matrix[self.rank, self.rank].item()
 
                     # Compute importance based on drop in diagonal sum
                     importance = original_score - occluded_score
-                    heatmap[d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] += importance
+                    self.maybe_print("Importance:", importance)
 
-        # Gather all partial heatmaps from GPUs
+                    # Update heatmap
+                    heatmap[d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = importance
+        
+        self.maybe_print("heatmap first 10 values before", heatmap[0, 0, :10])
+        median_value = np.mean(heatmap[0, 0, 10:30])
+        heatmap[0, 0, :10] = median_value
+        self.maybe_print("heatmap first 10 values after", heatmap[0, 0, :10])
+
         heatmap_tensor = torch.tensor(heatmap, dtype=torch.float32, device=self.accelerator.device)
+        heatmap_tensor = (heatmap_tensor - heatmap_tensor.min()) / (heatmap_tensor.max() - heatmap_tensor.min() + 1e-8)
 
-        if heatmap_tensor.max() > 0:
-            heatmap_tensor = (heatmap_tensor - heatmap_tensor.min()) / (heatmap_tensor.max() - heatmap_tensor.min() + 1e-8)
+        if self.world_size > 1:
+            dist.reduce(heatmap_tensor, dst=0, op=dist.ReduceOp.SUM)
 
-        print(f"[GPU {rank}] Heatmap Stats BEFORE Gathering: min={heatmap_tensor.min().item()}, max={heatmap_tensor.max().item()}, mean={heatmap_tensor.mean().item()}")
-            
-        gathered_heatmaps = [torch.zeros_like(heatmap_tensor) for _ in range(world_size)]
-        dist.all_gather(gathered_heatmaps, heatmap_tensor)
-
-        if rank == 0:
-            # Debug a specific depth slice
-            slice_idx = full_heatmap.shape[0] // 2  # Middle slice
-
-            print(f"Middle Slice Heatmap (Before Interpolation) - Depth {slice_idx}:")
-            print(full_heatmap[slice_idx].cpu().numpy())  # Print actual values
-
-            for i, h in enumerate(gathered_heatmaps):
-                print(f"[Gathered GPU {i}] Heatmap Stats: min={h.min().item()}, max={h.max().item()}, mean={h.mean().item()}")
-
-            # full_heatmap = sum([h.cpu() for h in gathered_heatmaps])
-            full_heatmap = torch.stack([h.cpu() for h in gathered_heatmaps]).max(dim=0)[0]
-
-            print(f"[Final Heatmap] Stats Before Interpolation: min={full_heatmap.min().item()}, max={full_heatmap.max().item()}, mean={full_heatmap.mean().item()}")
-
-            full_heatmap = full_heatmap.unsqueeze(0).unsqueeze(0)
+        if self.accelerator.is_main_process:            
+            full_heatmap = heatmap_tensor.unsqueeze(0).unsqueeze(0)
             full_heatmap = F.interpolate(full_heatmap,
                             size=original_image.shape,
                             mode='trilinear',
                             align_corners=False).squeeze(0).squeeze(0)
             full_heatmap = full_heatmap.detach().cpu().numpy()
 
-            print(f"[Final Heatmap] Stats After Interpolation: min={full_heatmap.min()}, max={full_heatmap.max()}, mean={full_heatmap.mean()}")
-
-            results_dir = self._results_subdirectory("occlusion") / f"{scan_name}.gif"
-            extra_info = "Text: 'lung'\nThreshold: 0.0\nApproach: sum heatmaps"
-            self.visualize_overlay(original_image, full_heatmap, scan_name, "Occlusion", results_dir, extra_info=extra_info)
+            results_dir = self._results_subdirectory("occlusion")
+            extra_info = f"Text: original\nThreshold: 0.0\nPatch size: {patch_size}\nStride: {stride}"
+            self.visualize_overlay(original_image, full_heatmap, scan_name, "Occlusion", results_dir / f"{scan_name}.gif", extra_info=extra_info)
 
 
     def visualize(self, **kwargs):
@@ -317,7 +309,8 @@ class Visualizations():
             if not val:
                 continue
 
-            torch.distributed.barrier()  # Ensure all processes are at the same point
+            if self.world_size > 1:
+                torch.distributed.barrier()  # Ensure all processes are at the same point
             
             if name == "attention":
                 dataloader = self.dist_dataloader
@@ -337,9 +330,9 @@ class Visualizations():
             self.maybe_print(f"{name} visualization started.")
 
             for batch in iter(dataloader):
-                images, texts, _, scan_names, original_scan_paths = [b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch]
+                image, texts, _, scan_names, original_scan_paths = [b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch]
                 text_tokens = self.tokenizer(
-                    "lung",
+                    texts,
                     return_tensors="pt",
                     padding="max_length",
                     truncation=True,
@@ -347,7 +340,7 @@ class Visualizations():
                 ).to(self.accelerator.device)
 
                 self.model.zero_grad()
-                visual_func(images, text_tokens, scan_names[0], original_scan_paths[0])
+                visual_func(image, text_tokens, scan_names[0], original_scan_paths[0])
 
             total_time = time.time() - start_time
             self.maybe_print(f"{name} visualization completed. Total visualization time: {str(timedelta(seconds=total_time))}")

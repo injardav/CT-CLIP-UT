@@ -1,5 +1,7 @@
+*.ipynb_checkpoints
 scripts/*/logs/*/*.txt
 src/__pycache__/*
 src/utils/__pycache__/*
 src/results
 src/notebooks/*.gif
+src/*.ipynb

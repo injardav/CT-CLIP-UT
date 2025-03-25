@@ -51,10 +51,10 @@ class InferenceDataset(Dataset):
                     
                     file_path = os.path.join(root, file)
                     findings, impressions = self.observations[file]
-                    onehotlabels = labels_df[labels_df["VolumeName"] == file]["one_hot_labels"].values
+                    labels = labels_df[labels_df["VolumeName"] == file]["one_hot_labels"].values
 
-                    if len(onehotlabels) > 0:
-                        samples.append((file_path, findings + impressions, onehotlabels[0], file))
+                    if len(labels) > 0:
+                        samples.append((file_path, findings + impressions, labels[0], file))
 
         return samples
 
@@ -76,12 +76,13 @@ class InferenceDataset(Dataset):
         return torch.tensor(img_data, dtype=torch.float32).unsqueeze(0)
 
     def __getitem__(self, index):
-        path, observations, onehotlabels, name = self.samples[index]
-        tensor = self._preprocess_scan(path, name)
+        path, observations, labels, name = self.samples[index]
+        image = self._preprocess_scan(path, name)
         name = name.replace(".nii.gz", "")
+        labels = torch.tensor(labels, dtype=torch.float32)
         observations = observations.replace('"', '')  
         observations = observations.replace('\'', '')  
         observations = observations.replace('(', '')  
         observations = observations.replace(')', '').strip()
 
-        return tensor, observations, onehotlabels, name, path
+        return image, observations, labels, name, path

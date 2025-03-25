@@ -91,29 +91,23 @@ def process_file(file_path, file_name, metadata_df):
     current_spacing = (z_spacing, xy_spacing, xy_spacing)
     target_spacing = (target_z_spacing, target_x_spacing, target_y_spacing)
 
-    # hu_min, hu_max = -1000, 1000
-    # img_data = np.clip(img_data, hu_min, hu_max)
-    # img_data = img_data / 1000.0  # roughly in [-1, 1]
-    hu_min, hu_max = -1000, 200
-    img_data = np.clip(img_data, hu_min, hu_max)
-    img_data = (img_data + 400) / 600.0
-
-    img_data = img_data.astype(np.float32)
-
-    # Transpose to (D, H, W)
+    img_data = slope * img_data + intercept
     img_data = img_data.transpose(2, 0, 1)
 
-    # Convert to tensor and add batch/channel dims: (1, 1, D, H, W)
     tensor = torch.tensor(img_data).unsqueeze(0).unsqueeze(0)
 
     # Resample to target spacing
-    resized = resize_array(tensor, current_spacing, target_spacing)
-    resized = resized[0][0]
+    img_data = resize_array(tensor, current_spacing, target_spacing)
+    img_data = img_data[0][0]
+    img_data = np.transpose(img_data, (1, 2, 0))
+    
+    hu_min, hu_max = -1000, 1000
+    img_data = np.clip(img_data, hu_min, hu_max)
+    img_data = img_data / 1000.0
 
     # Crop and pad: convert (D,H,W) to (H,W,D)
     target_shape_hw_d = (480, 480, 240)
-    resized_hw_d = np.transpose(resized, (1, 2, 0))
-    cropped = crop_and_pad(resized_hw_d, target_shape_hw_d, pad_value=-1)
+    cropped = crop_and_pad(img_data, target_shape_hw_d, pad_value=-1)
     final_array = np.transpose(cropped, (2, 0, 1))
 
     return final_array

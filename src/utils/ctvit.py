@@ -100,8 +100,6 @@ class CTViT(nn.Module):
 
         self.vq.train()
         tokens, _, _ = self.vq(tokens, mask=None)
-        # tokens = tokens + (quantized - tokens).detach()
-        # tokens.requires_grad_()
 
         tokens = rearrange(tokens, "b (t h w) d -> b t h w d", h=self.patch_height, w=self.patch_width)
         return tokens, attention_weights

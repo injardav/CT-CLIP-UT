@@ -8,33 +8,71 @@ import numpy as np
 import math
 
 
-def calculate_metrics(predictions, targets, pathologies):
-    """Calculate evaluation metrics for the model."""
-    metrics = {}
-    metrics['label_accuracy'] = accuracy_score(targets.flatten(), predictions.flatten())
+def calculate_metrics(soft_preds, targets, pathologies):
+    """
+    Calculate evaluation metrics for a multi-label model.
     
-    metrics['per_class_f1'] = f1_score(targets, predictions, average=None, zero_division=0)
-    metrics['sample_f1'] = f1_score(targets, predictions, average='samples', zero_division=0)
-    metrics['macro_f1'] = f1_score(targets, predictions, average='macro', zero_division=0)
-    metrics['micro_f1'] = f1_score(targets, predictions, average='micro', zero_division=0)
+    Args:
+        soft_preds (np.ndarray): Softmax/sigmoid probabilities of shape (N, C).
+        targets (np.ndarray): Binary ground truth labels of shape (N, C).
+        pathologies (List[str]): List of label names.
 
-    metrics['per_class_precision'] = precision_score(targets, predictions, average=None, zero_division=0)
-    metrics['macro_precision'] = precision_score(targets, predictions, average='macro', zero_division=0)
-    metrics['micro_precision'] = precision_score(targets, predictions, average='micro', zero_division=0)
+    Returns:
+        dict: Metrics (per-class + macro/micro/mAP/etc.)
+    """
+    num_classes = len(pathologies)
+    hard_preds = np.zeros_like(soft_preds)
+    per_class_metrics = {
+        "f1": [],
+        "precision": [],
+        "recall": [],
+        "roc_auc": [],
+    }
 
-    metrics['per_class_recall'] = recall_score(targets, predictions, average=None, zero_division=0)
-    metrics['macro_recall'] = recall_score(targets, predictions, average='macro', zero_division=0)
-    metrics['micro_recall'] = recall_score(targets, predictions, average='micro', zero_division=0)
+    for i, pathology in enumerate(pathologies):
+        y_true = targets[:, i]
+        y_prob = soft_preds[:, i]
 
-    # ROC-AUC per class, with handling for single-class issues
-    metrics['roc_aucs'] = [
-        roc_auc_score(targets[:, i], predictions[:, i]) if len(set(targets[:, i])) > 1 else np.nan
-        for i in range(len(pathologies))
-    ]
-    metrics['macro_roc_auc'] = np.nanmean(metrics['roc_aucs'])  # Mean AUC over all pathologies
+        # ROC + optimal threshold via distance to (0, 1)
+        fpr, tpr, thresh = roc_curve(y_true, y_prob)
+        dist = np.sqrt((1 - tpr)**2 + fpr**2)
+        best_idx = np.argmin(dist)
+        best_thresh = thresh[best_idx]
 
-    # Mean Average Precision (mAP) for multi-label classification
-    metrics['mAP'] = average_precision_score(targets, predictions, average='macro')
+        # Convert soft to hard predictions
+        y_pred = (y_prob > best_thresh).astype(int)
+        hard_preds[:, i] = y_pred
+
+        # Compute per-class metrics
+        per_class_metrics["f1"].append(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+        per_class_metrics["precision"].append(precision_score(y_true, y_pred, zero_division=0))
+        per_class_metrics["recall"].append(recall_score(y_true, y_pred, zero_division=0))
+        per_class_metrics["roc_auc"].append(roc_auc_score(y_true, y_prob))
+
+    # Now compute global/macro/micro metrics
+    metrics = {}
+
+    # Hard predictions used for global metrics
+    metrics["label_accuracy"] = accuracy_score(targets.flatten(), hard_preds.flatten())
+
+    metrics["per_class_f1"] = per_class_metrics["f1"]
+    metrics["macro_f1"] = np.nanmean(per_class_metrics["f1"])
+    metrics["micro_f1"] = f1_score(targets, hard_preds, average="micro", zero_division=0)
+    metrics["sample_f1"] = f1_score(targets, hard_preds, average="samples", zero_division=0)
+
+    metrics["per_class_precision"] = per_class_metrics["precision"]
+    metrics["macro_precision"] = np.nanmean(per_class_metrics["precision"])
+    metrics["micro_precision"] = precision_score(targets, hard_preds, average="micro", zero_division=0)
+
+    metrics["per_class_recall"] = per_class_metrics["recall"]
+    metrics["macro_recall"] = np.nanmean(per_class_metrics["recall"])
+    metrics["micro_recall"] = recall_score(targets, hard_preds, average="micro", zero_division=0)
+
+    metrics["roc_aucs"] = per_class_metrics["roc_auc"]
+    metrics["mean_roc_auc"] = np.nanmean(per_class_metrics["roc_auc"])
+
+    # Use soft preds for mAP
+    metrics["mAP"] = average_precision_score(targets, soft_preds, average="macro")
 
     return metrics
 
@@ -52,7 +90,7 @@ def save_metrics(metrics_list, pathologies, results_path):
             f.write(f"Micro Precision: {metrics['micro_precision']:.4f}\n")
             f.write(f"Macro Recall: {metrics['macro_recall']:.4f}\n")
             f.write(f"Micro Recall: {metrics['micro_recall']:.4f}\n")
-            f.write(f"Macro ROC-AUC: {metrics['macro_roc_auc']:.4f}\n")
+            f.write(f"Mean ROC-AUC: {metrics['mean_roc_auc']:.4f}\n")
             f.write(f"Mean Average Precision (mAP): {metrics['mAP']:.4f}\n\n")
 
             # Collect per-class metrics into a table
@@ -154,7 +192,7 @@ def plot_all_metrics(metrics_history, results_path):
 
     metric_names = [
         "label_accuracy", "sample_f1", "macro_f1", "micro_f1", "macro_precision", 
-        "micro_precision", "macro_recall", "micro_recall", "macro_roc_auc", "mAP"
+        "micro_precision", "macro_recall", "micro_recall", "mean_roc_auc", "mAP"
     ]
 
     metric_titles = [
@@ -211,10 +249,10 @@ def plot_training_progress(train_losses, valid_losses, results_path):
     """
     Plots training loss and validation accuracy side-by-side across epochs.
 
-    Parameters:
-    - train_losses: Dictionary with keys 'steps' and 'epochs', each containing lists of loss values.
-    - valid_losses: List of averaged validation losses.
-    - results_path: Path to save the output plot.
+    Args:
+        train_losses (Dict) : Dictionary with keys 'steps' and 'epochs', each containing lists of loss values.
+        valid_losses (List) : List of averaged validation losses.
+        results_path (String) : Path to save the output plot.
     """
     results_path = Path(results_path)
     results_path.mkdir(parents=True, exist_ok=True)

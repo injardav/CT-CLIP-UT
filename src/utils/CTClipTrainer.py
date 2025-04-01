@@ -16,7 +16,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 from utils.TrainDataset import TrainDataset
 from utils.InferenceDataset import InferenceDataset
 from utils.metrics import *
-from CTCLIP import CTCLIP
+from models.ctclip import CTCLIP
 from utils.optimizer import get_optimizer
 
 

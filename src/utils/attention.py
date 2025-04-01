@@ -318,18 +318,20 @@ class Transformer(nn.Module):
         self_attn_mask = None,
         cross_attn_context_mask = None
     ):
-        attention_weights = None
+        self_attention_weights = None
+        cross_attention_weights = None
 
         for peg, self_attn, cross_attn, ff in self.layers:
             if exists(peg):
                 x = peg(x, shape = video_shape) + x
 
-            x_out, attention_weights = self_attn(x, attn_bias = attn_bias, mask = self_attn_mask)
+            x_out, self_attention_weights = self_attn(x, attn_bias = attn_bias, mask = self_attn_mask)
             x = x_out + x
 
             if exists(cross_attn) and exists(context):
-                x = cross_attn(x, context = context, mask = cross_attn_context_mask) + x
+                x_out, cross_attention_weights = cross_attn(x, context = context, mask = cross_attn_context_mask)
+                x = x_out + x
 
             x = ff(x) + x
         
-        return self.norm_out(x), attention_weights
+        return self.norm_out(x), self_attention_weights, cross_attention_weights

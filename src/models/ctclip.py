@@ -106,12 +106,8 @@ class CTCLIP(nn.Module):
         # --- Encoding ---
         text_output = self.text_transformer(**text_inputs).last_hidden_state[:, 0, :]
 
-        # swin encoder approach
-        # image_output = self.visual_transformer(image_inputs)[-1]
-        # image_output = image_output.mean(dim=[2, 3, 4])
-
         # vit encoder approach
-        image_tokens, attention_weights = self.visual_transformer(image_inputs)
+        image_tokens, spatial_attention_weights, _ = self.visual_transformer(image_inputs)
         image_output = image_tokens.mean(dim=1)
         image_output = image_output.view(image_output.shape[0], -1)
 
@@ -130,4 +126,4 @@ class CTCLIP(nn.Module):
         # --- Similarity Matrix ---
         sim_matrix = image_latents @ text_latents.t() * self.temperature.exp()
 
-        return sim_matrix, image_latents, text_latents, self.temperature.exp(), image_tokens, attention_weights
+        return sim_matrix, image_latents, text_latents, self.temperature.exp(), image_tokens, spatial_attention_weights

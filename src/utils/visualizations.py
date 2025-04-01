@@ -11,9 +11,8 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import scipy.stats as stats
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from CTCLIP import CTCLIP
+from models.ctclip import CTCLIP
 from accelerate import Accelerator
 from pathlib import Path
 
@@ -45,8 +44,8 @@ class Visualizations():
         single_dataloader: DataLoader,
         dist_dataloader: DataLoader,
         batch_size: int,
-        tokenizer: BertTokenizer,
-        results_folder: Path
+        results_folder: Path,
+        tokenizer: BertTokenizer = False
     ):
         self.model = model.module if hasattr(model, "module") else model
         self.accelerator = accelerator
@@ -124,6 +123,60 @@ class Visualizations():
         return loss
 
 
+    def frame_func(self, ax, vol_info, frame_idx):
+        volume = vol_info["volume"]
+        cmap = vol_info.get("cmap", "bone")
+        vmin = vol_info.get("vmin", None)
+        vmax = vol_info.get("vmax", None)
+        alpha = vol_info.get("alpha", None)
+        title = vol_info.get("title", f"Slice {frame_idx}")
+    
+        ax.cla()
+        ax.set_title(title)
+        im = ax.imshow(volume[frame_idx, :, :], cmap=cmap, alpha=alpha, vmin=vmin, vmax=vmax, origin="lower")
+        
+        return [im]
+    
+    
+    def dynamic_subplots(self, volume_data, save_path, subplot_size=(4, 4)):
+        """
+        Plots data in subplots, automatically adjusting figure size.
+        
+        Parameters:
+        - volume_data: List of lists of 3D arrays (e.g. [[vol1, vol2], [vol3, vol4]]).
+        - subplot_size: Size (width, height) of each subplot in inches.
+        - save_path: Path to save the animation.
+        """
+        nrows = len(volume_data)
+        ncols = max(len(row) for row in volume_data)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(subplot_size[0]*ncols, subplot_size[1]*nrows))
+        plt.figure(fig.number)
+
+        for ax_row in axes:
+            for ax in ax_row:
+                ax.figure = fig
+    
+        if nrows == 1: axes = [axes]
+        if ncols == 1: axes = [[ax] for ax in axes]
+    
+        n_frames = next(iter(volume_data[0]))["volume"].shape[0]
+
+        all_frames = []
+        for frame_idx in range(n_frames):
+            frame_artists = []
+            for i, row in enumerate(volume_data):
+                for j, vol_info in enumerate(row):
+                    ax = axes[i][j]
+                    artist = self.frame_func(ax, vol_info, frame_idx)
+                    print("artist figure", artist[0].figure)
+                    frame_artists += artist 
+            all_frames.append(frame_artists)
+        
+        ani = animation.ArtistAnimation(fig, all_frames, interval=100, blit=False, repeat_delay=1000)
+        ani.save(save_path, writer="pillow", fps=10)
+        plt.close(fig)
+    
+    
     def visualize_overlay(self, image, overlay, scan_name, overlay_name, save_path, threshold=0.0, extra_info=""):
         """
         Creates and saves an animated visualization of a CT scan, an overlay and a combination of both.
@@ -248,6 +301,7 @@ class Visualizations():
         heatmap = np.zeros((D, H, W))
         importance_values = []
         iteration_count = 0
+        volume_data = []
 
         # Compute original similarity score (before occlusion)
         with torch.no_grad():
@@ -262,6 +316,7 @@ class Visualizations():
         # Iterate through the assigned depth range for this GPU
         for d in range(d_start, min(d_end, D - patch_size[0] + 1), stride[0]):
             for h in range(0, min(H, H - patch_size[1] + 1), stride[1]):
+                occluded_volumes = []
                 for w in range(0, min(W, W - patch_size[2] + 1), stride[2]):
                     occluded_image = image.clone().detach()
                     occluded_image[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = black_value
@@ -272,15 +327,20 @@ class Visualizations():
 
                     # Compute importance based on drop in diagonal sum
                     importance = original_score - occluded_score
-                    self.maybe_print("Importance:", importance)
 
                     # Update heatmap
                     heatmap[d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = importance
-        
-        self.maybe_print("heatmap first 10 values before", heatmap[0, 0, :10])
-        median_value = np.mean(heatmap[0, 0, 10:30])
-        heatmap[0, 0, :10] = median_value
-        self.maybe_print("heatmap first 10 values after", heatmap[0, 0, :10])
+
+                    # Collect occluded volume data for first depth section only
+                    if d == 0:
+                        occluded_volumes.append({
+                            "volume": occluded_image[:, :, d:d+patch_size[0], :, :].squeeze(0).squeeze(0).cpu().numpy(),
+                            "title": f"Depth: {d}:{d+patch_size[0]} | Height: {h}:{h+patch_size[1]} | Width: {w}:{w+patch_size[2]}"
+                        })
+                
+                if d == 0 and occluded_volumes:
+                    volume_data.append(occluded_volumes)
+
 
         heatmap_tensor = torch.tensor(heatmap, dtype=torch.float32, device=self.accelerator.device)
         heatmap_tensor = (heatmap_tensor - heatmap_tensor.min()) / (heatmap_tensor.max() - heatmap_tensor.min() + 1e-8)
@@ -299,6 +359,7 @@ class Visualizations():
             results_dir = self._results_subdirectory("occlusion")
             extra_info = f"Text: original\nThreshold: 0.0\nPatch size: {patch_size}\nStride: {stride}"
             self.visualize_overlay(original_image, full_heatmap, scan_name, "Occlusion", results_dir / f"{scan_name}.gif", extra_info=extra_info)
+            # self.dynamic_subplots(volume_data, results_dir / f"{scan_name}_dynamic.gif")
 
 
     def visualize(self, **kwargs):

@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 from utils.preprocess import process_file
 
 class InferenceDataset(Dataset):
-    def __init__(self, data_folder, reports, metadata, labels, num_samples=500):
+    def __init__(self, data_folder, reports, metadata, labels, num_samples=500, model_type="ctclip"):
         """
         Dataset for processing CT scans and associated inference data.
 
@@ -16,12 +16,14 @@ class InferenceDataset(Dataset):
             metadata (str): Path to the metadata CSV file.
             labels (str): Path to the labels CSV file.
             num_samples (int, optional): Number of samples to limit the dataset. Defaults to 500.
+            model_type (str, optional): Type of the model, either 'ctclip' or 'ctgenerate'. Defaults to 'ctclip'.
         """
         self.data_folder = data_folder
         self.metadata_df = pd.read_csv(metadata)
         self.labels = labels
         self.observations = self._load_observations(reports)
         self.samples = self._prepare_samples()
+        self.model_type = model_type
 
         if num_samples < len(self.samples):
             self.samples = self.samples[:num_samples]
@@ -61,23 +63,9 @@ class InferenceDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _preprocess_scan(self, path, name):
-        """Preprocess a raw NIfTI CT scan to tensor."""
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"File not found: {path}")
-
-        try:
-            img_data = process_file(path, name, self.metadata_df)
-        except zipfile.BadZipFile:
-            raise RuntimeError(f"Corrupted file: {path}")
-        except Exception as e:
-            raise RuntimeError(f"Error loading {path}: {e}")
-
-        return torch.tensor(img_data, dtype=torch.float32).unsqueeze(0)
-
     def __getitem__(self, index):
         path, observations, labels, name = self.samples[index]
-        image = self._preprocess_scan(path, name)
+        image = process_file(path, name, self.metadata_df, self.model_type)
         name = name.replace(".nii.gz", "")
         labels = torch.tensor(labels, dtype=torch.float32)
         observations = observations.replace('"', '')  

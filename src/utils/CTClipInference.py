@@ -19,7 +19,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 from utils.InferenceDataset import InferenceDataset
 from utils.metrics import *
 from utils.visualizations import Visualizations
-from CTCLIP import CTCLIP
+from models.ctclip import CTCLIP
 
 
 PATHOLOGIES = [
@@ -66,8 +66,6 @@ class CTClipInference(nn.Module):
         valid_labels: str,
         valid_metadata: str,
         tokenizer: BertTokenizer = None,
-        lr: float = 1e-4,
-        wd: float = 0.0,
         results_folder: str = "./results",
         num_workers: int = 8,
         num_valid_samples: int = 0,
@@ -126,8 +124,6 @@ class CTClipInference(nn.Module):
         )
 
         self.metrics = []
-        self.best_score = 0
-
         self.results_folder = results_folder
         if self.accelerator.is_main_process:
             # Create correct results directory structure with date

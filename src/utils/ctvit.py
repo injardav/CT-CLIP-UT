@@ -63,8 +63,8 @@ class CTViT(nn.Module):
 
         self.enc_spatial_transformer = Transformer(depth=spatial_depth, **transformer_kwargs)
         self.enc_temporal_transformer = Transformer(depth=temporal_depth, **transformer_kwargs)
-        self.vq = VectorQuantize(dim=dim, codebook_size=codebook_size, use_cosine_sim=True)
-
+        self.vq = VectorQuantize(dim=dim, codebook_size=codebook_size, use_cosine_sim=True, freeze_codebook=True if not self.training else False)
+    
     def load_state_dict(self, *args, **kwargs):
         """
         Load a state dictionary into the model.
@@ -114,8 +114,8 @@ class CTViT(nn.Module):
         tokens, attention_weights, cross_attention_weights = self.encode(tokens)
         tokens, packed_fhw_shape = pack([tokens], "b * d")
 
-        # self.vq.train()
-        tokens, indices, _ = self.vq(tokens, mask=None)
+        self.vq.train()    
+        tokens, indices, _ = self.vq(tokens, freeze_codebook=not self.training)
 
         if return_only_codebook_ids:
             indices, = unpack(indices, packed_fhw_shape, 'b *')

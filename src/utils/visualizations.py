@@ -71,6 +71,7 @@ class Visualizations():
 
         self.maybe_print = print if self.accelerator.is_main_process else lambda *args, **kwargs: None
         self.saved_outputs = {}
+        self.hooks = []
 
         self.rank = self.accelerator.process_index
         self.world_size = self.accelerator.num_processes
@@ -142,14 +143,26 @@ class Visualizations():
         """
         Create and register forward/backward hooks to capture targeted layer features and gradients.
         """
-        target_layer = self.model.module.visual_transformer.vq
-        target_layer.register_forward_hook(self.save_activations)
+        target_layer = self.model.visual_transformer.vq
+        hook = target_layer.register_forward_hook(self._save_activations)
+        self.hooks.append(hook)
 
-        target_layer = self.model.module.visual_transformer.enc_spatial_transformer.layers[-1][1]
-        target_layer.register_forward_hook(self._save_activations_spatial)
+        target_layer = self.model.visual_transformer.enc_spatial_transformer.layers[-1][1]
+        hook = target_layer.register_forward_hook(self._save_activations_spatial)
+        self.hooks.append(hook)
 
-        target_layer = self.model.module.visual_transformer.enc_temporal_transformer.layers[-1][1]
-        target_layer.register_forward_hook(self._save_activations_temporal)
+        target_layer = self.model.visual_transformer.enc_temporal_transformer.layers[-1][1]
+        hook = target_layer.register_forward_hook(self._save_activations_temporal)
+        self.hooks.append(hook)
+
+
+    def _remove_hooks(self):
+        """
+        Remove all hooks attached to model from previous gradient-related activities.
+        """
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
 
     
     def _loss_function(self, sim_matrix, targets=None):
@@ -311,6 +324,7 @@ class Visualizations():
         with torch.enable_grad():
             sim_matrix, *_ = self.model(text_tokens, image)
             sim_matrix[self.rank, self.rank].backward()
+        self._remove_hooks()
 
         original_image = self._read_nii_data(original_scan_path).squeeze()      # torch.Size([240, 480, 480])
 
@@ -354,7 +368,7 @@ class Visualizations():
             self.visualize_overlay(original_image, cam, scan_name, "Grad-CAM", results_dir / f"{scan_name}.gif", threshold=0.0, extra_info=extra_info)
 
 
-    def visualize_occlusion_sensitivity(self, image, text_tokens, scan_name, original_scan_path, patch_size=(10,20,20), stride=(10,20,20)):
+    def visualize_occlusion_sensitivity(self, image, text_tokens, scan_name, original_scan_path, patch_size=(20,40,40), stride=(20,40,40)):
         black_value = image.max().item()
         original_image = self._read_nii_data(original_scan_path)
         _, _, D, H, W = image.shape
@@ -362,16 +376,8 @@ class Visualizations():
         importance_values = []
         iteration_count = 0
 
-        print("Perform 'warmup' due to model instability")
-        scores = []
-        for i in range(100):
-            with torch.no_grad():
-                sim_matrix, *_ = self.model(text_tokens, image)
-                scores.append(sim_matrix[self.rank, self.rank].item())
-        print("Repeat scores for same patch:", scores)
-
         # Compute original similarity score (before occlusion)
-        with torch.no_grad():
+        with torch.enable_grad():
             original_sim_matrix, *_ = self.model(text_tokens, image)
             original_score = original_sim_matrix[self.rank, self.rank].item()
 
@@ -394,7 +400,7 @@ class Visualizations():
             occluded_image = image.clone().detach()
             occluded_image[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = black_value
 
-            with torch.no_grad():
+            with torch.enable_grad():
                 occluded_sim_matrix, *_ = self.model(text_tokens, occluded_image)
                 occluded_score = occluded_sim_matrix[self.rank, self.rank].item()
 

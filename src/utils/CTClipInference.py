@@ -239,8 +239,8 @@ class CTClipInference(nn.Module):
         if self.visualize:
             self.vis.visualize(
                 attention=False,
-                grad_cam=False,
-                occlusion=True
+                grad_cam=True,
+                occlusion=False
             )
             
         total_time = time.time() - start_time

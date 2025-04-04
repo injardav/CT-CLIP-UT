@@ -1,5 +1,6 @@
 import time
 import torch
+import random
 import numpy as np
 import nibabel as nib
 import torch.nn.functional as F
@@ -18,6 +19,19 @@ from pathlib import Path
 
 from torch.utils.data import DataLoader
 from transformers import BertTokenizer
+
+
+# Set seeds
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+
+# Force deterministic behavior
+torch.use_deterministic_algorithms(True)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
 PATHOLOGIES = [
@@ -45,9 +59,9 @@ class Visualizations():
         dist_dataloader: DataLoader,
         batch_size: int,
         results_folder: Path,
-        tokenizer: BertTokenizer = False
+        tokenizer: BertTokenizer
     ):
-        self.model = model.module if hasattr(model, "module") else model
+        self.model = model
         self.accelerator = accelerator
         self.single_dataloader = single_dataloader
         self.dist_dataloader = dist_dataloader
@@ -94,19 +108,48 @@ class Visualizations():
             return
 
     
+    def _save_activations(self, module, input, output):
+        features = output[0]
+        self.saved_outputs["vq_features"] = features.detach()
+
+        def save_grad(grad):
+            self.saved_outputs["vq_gradients"] = grad
+
+        features.register_hook(save_grad)
+
+
+    def _save_activations_spatial(self, module, input, output):
+        features = output[0]
+        self.saved_outputs["spatial_features"] = features.detach()
+
+        def save_grad(grad):
+            self.saved_outputs["spatial_gradients"] = grad
+
+        features.register_hook(save_grad)
+
+
+    def _save_activations_temporal(self, module, input, output):
+        features = output[0]
+        self.saved_outputs["temporal_features"] = features.detach()
+
+        def save_grad(grad):
+            self.saved_outputs["temporal_gradients"] = grad
+
+        features.register_hook(save_grad)
+
+    
     def _register_hooks(self):
         """
-        Create and register forward/backward hooks to capture spatial features and gradients.
+        Create and register forward/backward hooks to capture targeted layer features and gradients.
         """
-        spatial_attention_layer = self.model.visual_transformer.enc_spatial_transformer
+        target_layer = self.model.module.visual_transformer.vq
+        target_layer.register_forward_hook(self.save_activations)
 
-        spatial_attention_layer.register_forward_hook(
-            lambda module, input, output: self.saved_outputs.update({"spatial_features": output[0]})
-        )
+        target_layer = self.model.module.visual_transformer.enc_spatial_transformer.layers[-1][1]
+        target_layer.register_forward_hook(self._save_activations_spatial)
 
-        spatial_attention_layer.register_full_backward_hook(
-            lambda module, grad_input, grad_output: self.saved_outputs.update({"spatial_gradients": grad_output[0]})
-        )
+        target_layer = self.model.module.visual_transformer.enc_temporal_transformer.layers[-1][1]
+        target_layer.register_forward_hook(self._save_activations_temporal)
 
     
     def _loss_function(self, sim_matrix, targets=None):
@@ -189,7 +232,7 @@ class Visualizations():
             save_path (str): Path to save the animation.
         """
         # Normalize overlay between 0 and 1 for visualization
-        overlay = (overlay - np.min(overlay)) / (np.max(overlay) - np.min(overlay) + 1e-8)
+        # overlay = (overlay - np.min(overlay)) / (np.max(overlay) - np.min(overlay) + 1e-8)
         overlay[overlay < threshold] = 0
 
         # Set up figure with 3 subplots
@@ -241,10 +284,10 @@ class Visualizations():
             *_, image_tokens, attention_weights = self.model(text_tokens, image)
         
         original_image = self._read_nii_data(original_scan_path)
-        image_tokens = image_tokens.norm(dim=-1)           # L2 norm over features
+        image_tokens = image_tokens.norm(dim=-1)                    # L2 norm over features
 
-        attention_weights = attention_weights.mean(dim=1)  # Average over heads
-        attention_weights = attention_weights.sum(dim=-1)  # Sum over patches
+        attention_weights = attention_weights.mean(dim=1)           # Average over heads
+        attention_weights = attention_weights.sum(dim=-1)           # Sum over patches
         attention_weights = attention_weights.view(-1, 24, 24, 24)
 
         importance_map = image_tokens * attention_weights
@@ -269,17 +312,31 @@ class Visualizations():
             sim_matrix, *_ = self.model(text_tokens, image)
             sim_matrix[self.rank, self.rank].backward()
 
-        original_image = self._read_nii_data(original_scan_path).squeeze(0)                                                     # torch.Size([1, 1, 240, 480, 480])
-        spatial_features = self.saved_outputs.get("spatial_features")                                                           # torch.Size([24, 576, 512])
-        spatial_gradients = self.saved_outputs.get("spatial_gradients")                                                         # torch.Size([24, 576, 512])
-        
-        spatial_features = spatial_features.to(torch.float64)
-        spatial_gradients = spatial_gradients.to(torch.float64)
+        original_image = self._read_nii_data(original_scan_path).squeeze()      # torch.Size([240, 480, 480])
 
-        spatial_gradients = spatial_gradients.mean(dim=1, keepdim=True)
+        # spatial_features = self.saved_outputs.get("spatial_features").view(-1, 512)             # torch.Size([24, 576, 512]) --> torch.Size([13824, 512])
+        # temporal_features = self.saved_outputs.get("temporal_features").view(-1, 512)             # torch.Size([24, 576, 512]) --> torch.Size([13824, 512])
+
+        # spatial_gradients = self.saved_outputs.get("spatial_gradients").view(-1, 512)           # torch.Size([24, 576, 512]) --> torch.Size([13824, 512])
+        # temporal_gradients = self.saved_outputs.get("temporal_gradients").view(-1, 512)           # torch.Size([24, 576, 512]) --> torch.Size([13824, 512])
+
+        # spatial_gradients = spatial_gradients.mean(dim=0, keepdim=True)
+        # temporal_gradients = temporal_gradients.mean(dim=0, keepdim=True)
+
+        # spatial_cam = (spatial_gradients * spatial_features).sum(dim=-1).relu()
+        # temporal_cam = (temporal_gradients * temporal_features).sum(dim=-1).relu()
+
+        # spatial_cam = (spatial_cam - spatial_cam.min()) / (spatial_cam.max() + 1e-8)
+        # temporal_cam = (temporal_cam - temporal_cam.min()) / (temporal_cam.max() + 1e-8)
+
+        # cam = torch.sqrt(spatial_cam * temporal_cam + 1e-8)
+
+        features = self.saved_outputs.get("vq_features").view(-1, 512)
+        gradients = self.saved_outputs.get("vq_gradients").view(-1, 512).mean(dim=0, keepdim=True)
         
-        cam = (spatial_gradients * spatial_features).sum(dim=-1)
+        cam = (gradients * features).sum(dim=-1)
         cam = cam.relu()
+        cam = (cam - cam.min()) / (cam.max() + 1e-8)
         cam = cam.view(24, 24, 24)
 
         cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0),
@@ -288,20 +345,30 @@ class Visualizations():
                             align_corners=False).squeeze(0).squeeze(0)
         cam = cam.detach().cpu().numpy()
 
+        original_image = np.rot90(original_image, k=-1, axes=(1, 2))
+        cam = np.rot90(cam, k=-1, axes=(1, 2))
+
         if self.accelerator.process_index == 0:
             results_dir = self._results_subdirectory("grad_cam")
-            extra_info = "Text: original\nThreshold: 0.0\nBackprop: rank sim score\nGrad target: input"
+            extra_info = "Text: original\nThreshold: 0.0\nBackprop: rank sim score"
             self.visualize_overlay(original_image, cam, scan_name, "Grad-CAM", results_dir / f"{scan_name}.gif", threshold=0.0, extra_info=extra_info)
 
 
-    def visualize_occlusion_sensitivity(self, image, text_tokens, scan_name, original_scan_path, patch_size=(40,80,80), stride=(40,80,80)):
+    def visualize_occlusion_sensitivity(self, image, text_tokens, scan_name, original_scan_path, patch_size=(10,20,20), stride=(10,20,20)):
         black_value = image.max().item()
         original_image = self._read_nii_data(original_scan_path)
         _, _, D, H, W = image.shape
         heatmap = np.zeros((D, H, W))
         importance_values = []
         iteration_count = 0
-        volume_data = []
+
+        print("Perform 'warmup' due to model instability")
+        scores = []
+        for i in range(100):
+            with torch.no_grad():
+                sim_matrix, *_ = self.model(text_tokens, image)
+                scores.append(sim_matrix[self.rank, self.rank].item())
+        print("Repeat scores for same patch:", scores)
 
         # Compute original similarity score (before occlusion)
         with torch.no_grad():
@@ -310,36 +377,29 @@ class Visualizations():
 
         # Divide Depth (D) among GPUs
         # Each GPU is responsible for a subset of the depth slices (D)
+        # This part is needed if occlusion is run with multiple GPU's
         depth_splits = torch.chunk(torch.arange(D), self.world_size)
         d_start, d_end = depth_splits[self.rank][0].item(), min(depth_splits[self.rank][-1].item() + 1, D)
 
-        # Iterate through the assigned depth range for this GPU
-        for d in range(d_start, min(d_end, D - patch_size[0] + 1), stride[0]):
-            for h in range(0, min(H, H - patch_size[1] + 1), stride[1]):
-                occluded_volumes = []
-                for w in range(0, min(W, W - patch_size[2] + 1), stride[2]):
-                    occluded_image = image.clone().detach()
-                    occluded_image[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = black_value
+        # Precompute all possible patch starting coordinates
+        patch_coords = [
+            (d, h, w)
+            for d in range(d_start, min(d_end, D - patch_size[0] + 1), stride[0])
+            for h in range(0, min(H, H - patch_size[1] + 1), stride[1])
+            for w in range(0, min(W, W - patch_size[2] + 1), stride[2])
+        ]
 
-                    with torch.no_grad():
-                        occluded_sim_matrix, *_ = self.model(text_tokens, occluded_image)
-                        occluded_score = occluded_sim_matrix[self.rank, self.rank].item()
+        # Iterate through the assigned patch coordinates and occlude voxel windows
+        for d, h, w in patch_coords:
+            occluded_image = image.clone().detach()
+            occluded_image[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = black_value
 
-                    # Compute importance based on drop in diagonal sum
-                    importance = original_score - occluded_score
+            with torch.no_grad():
+                occluded_sim_matrix, *_ = self.model(text_tokens, occluded_image)
+                occluded_score = occluded_sim_matrix[self.rank, self.rank].item()
 
-                    # Update heatmap
-                    heatmap[d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = importance
-
-                    # Collect occluded volume data for first depth section only
-                    if d == 0:
-                        occluded_volumes.append({
-                            "volume": occluded_image[:, :, d:d+patch_size[0], :, :].squeeze(0).squeeze(0).cpu().numpy(),
-                            "title": f"Depth: {d}:{d+patch_size[0]} | Height: {h}:{h+patch_size[1]} | Width: {w}:{w+patch_size[2]}"
-                        })
-                
-                if d == 0 and occluded_volumes:
-                    volume_data.append(occluded_volumes)
+            importance = original_score - occluded_score
+            heatmap[d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = importance
 
 
         heatmap_tensor = torch.tensor(heatmap, dtype=torch.float32, device=self.accelerator.device)
@@ -355,6 +415,9 @@ class Visualizations():
                             mode='trilinear',
                             align_corners=False).squeeze(0).squeeze(0)
             full_heatmap = full_heatmap.detach().cpu().numpy()
+            
+            original_image = np.rot90(original_image, k=-1, axes=(1, 2))
+            full_heatmap = np.rot90(full_heatmap, k=-1, axes=(1, 2))
 
             results_dir = self._results_subdirectory("occlusion")
             extra_info = f"Text: original\nThreshold: 0.0\nPatch size: {patch_size}\nStride: {stride}"

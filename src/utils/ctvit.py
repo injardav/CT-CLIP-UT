@@ -114,7 +114,7 @@ class CTViT(nn.Module):
         tokens, attention_weights, cross_attention_weights = self.encode(tokens)
         tokens, packed_fhw_shape = pack([tokens], "b * d")
 
-        self.vq.train()
+        # self.vq.train()
         tokens, indices, _ = self.vq(tokens, mask=None)
 
         if return_only_codebook_ids:

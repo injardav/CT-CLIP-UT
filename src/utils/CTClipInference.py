@@ -123,6 +123,8 @@ class CTClipInference(nn.Module):
             self.model
         )
 
+        self.model.eval()
+
         self.metrics = []
         self.results_folder = results_folder
         if self.accelerator.is_main_process:
@@ -139,8 +141,8 @@ class CTClipInference(nn.Module):
             self.single_dist_dl,
             self.dl,
             self.batch_size,
-            self.tokenizer,
-            self.results_folder
+            self.results_folder,
+            self.tokenizer
         )
         
         self.maybe_print(f"Validation size: {len(self.dl.dataset)}")
@@ -230,8 +232,6 @@ class CTClipInference(nn.Module):
         """
         start_time = time.time()
         self.maybe_print("Evaluation started")
-    
-        self.model.eval()
 
         if self.zero_shot:
             self.zeroshot()

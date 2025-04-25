@@ -100,7 +100,7 @@ class CTViT(nn.Module):
         tokens, temporal_attention_weights, temporal_cross_attention_weights = self.enc_temporal_transformer(tokens, video_shape=video_shape)
         tokens = rearrange(tokens, "(b h w) t d -> b t h w d", b=batch_size, h=self.patch_height, w=self.patch_width)
 
-        return tokens, spatial_attention_weights, spatial_cross_attention_weights
+        return tokens, (spatial_attention_weights, spatial_cross_attention_weights), (temporal_attention_weights, temporal_cross_attention_weights)
 
     def forward(self, image, return_only_codebook_ids=False):
         if self.model_type == "ctgenerate":
@@ -111,7 +111,7 @@ class CTViT(nn.Module):
         else:
             tokens = self.to_patch_emb(image)
     
-        tokens, attention_weights, cross_attention_weights = self.encode(tokens)
+        tokens, spatial_attention_weights, temporal_attention_weights = self.encode(tokens)
         tokens, packed_fhw_shape = pack([tokens], "b * d")
 
         self.vq.train()    
@@ -122,4 +122,4 @@ class CTViT(nn.Module):
             return indices
 
         tokens = rearrange(tokens, "b (t h w) d -> b t h w d", h=self.patch_height, w=self.patch_width)
-        return tokens, attention_weights, cross_attention_weights
+        return tokens, spatial_attention_weights, temporal_attention_weights

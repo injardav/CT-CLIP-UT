@@ -96,18 +96,18 @@ class CTCLIP(nn.Module):
         else:
             return features
 
-    def forward(self, text_inputs, image_inputs):
+    def forward(self, text_inputs, image_inputs, text_embeds=None):
         """
         Forward pass for CTCLIP with spatial token contrast.
         """
         # Define a helper function for printing only on the main process.
-        maybe_print = print if self.accelerator.is_main_process else lambda *args, **kwargs: None
+        maybe_print = print if getattr(self, "accelerator", None) and self.accelerator.is_main_process else lambda *args, **kwargs: None
 
         # --- Encoding ---
-        text_output = self.text_transformer(**text_inputs).last_hidden_state[:, 0, :]
+        text_output = self.text_transformer(**text_inputs).last_hidden_state[:, 0, :] if text_inputs else text_embeds
 
         # vit encoder approach
-        image_tokens, spatial_attention_weights, _ = self.visual_transformer(image_inputs)
+        image_tokens, spatial_attention_weights, temporal_attention_weights = self.visual_transformer(image_inputs)
         image_output = image_tokens.mean(dim=1)
         image_output = image_output.view(image_output.shape[0], -1)
 
@@ -126,4 +126,4 @@ class CTCLIP(nn.Module):
         # --- Similarity Matrix ---
         sim_matrix = image_latents @ text_latents.t() * self.temperature.exp()
 
-        return sim_matrix, image_latents, text_latents, self.temperature.exp(), image_tokens, spatial_attention_weights
+        return sim_matrix, image_latents, text_latents, self.temperature.exp(), image_tokens, spatial_attention_weights, temporal_attention_weights

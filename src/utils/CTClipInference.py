@@ -67,6 +67,7 @@ class CTClipInference(nn.Module):
         valid_metadata: str,
         tokenizer: BertTokenizer = None,
         results_folder: str = "./results",
+        diff_embeds_folder: str = "./resources",
         num_workers: int = 8,
         num_valid_samples: int = 0,
         zero_shot: bool = False,
@@ -127,6 +128,7 @@ class CTClipInference(nn.Module):
 
         self.metrics = []
         self.results_folder = results_folder
+        self.diff_embeds_folder = diff_embeds_folder
         if self.accelerator.is_main_process:
             # Create correct results directory structure with date
             self.results_folder = Path(results_folder) / datetime.now().strftime("%d-%m-%Y")
@@ -142,6 +144,7 @@ class CTClipInference(nn.Module):
             self.dl,
             self.batch_size,
             self.results_folder,
+            self.diff_embeds_folder,
             self.tokenizer
         )
         
@@ -239,8 +242,8 @@ class CTClipInference(nn.Module):
         if self.visualize:
             self.vis.visualize(
                 attention=False,
-                grad_cam=True,
-                occlusion=False
+                grad_cam=False,
+                occlusion=True
             )
             
         total_time = time.time() - start_time

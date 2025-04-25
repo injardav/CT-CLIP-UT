@@ -29,7 +29,7 @@ vit_encoder = CTViT(
     dim_head = 32,
     heads = 8
 )
---- 
+
 clip = CTCLIP(
     text_encoder = text_encoder,
     image_encoder = vit_encoder,
@@ -47,6 +47,8 @@ inference = CTClipInference(
     valid_labels = "/mnt/ct_clip/CT-CLIP-UT/labels/valid_labels.csv",
     valid_metadata = "/mnt/ct_clip/CT-CLIP-UT/metadata/valid_metadata.csv",
     results_folder = "/mnt/ct_clip/CT-CLIP-UT/src/results/valid/ctclip",
+    diff_embeds_folder = "/mnt/ct_clip/CT-CLIP-UT/src/resources/pathology_diff_embeddings.npy",
+    tokenizer = tokenizer,
     batch_size = 1,
     num_workers = 4,
     num_valid_samples = 1,

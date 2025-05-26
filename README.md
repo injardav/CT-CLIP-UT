@@ -17,16 +17,34 @@ This work focuses on evaluating the interpretability and spatial localization ca
 The following visualizations demonstrate the model’s response under different attribution techniques.
 
 ### Raw Attention Maps
-![Raw Attention Weights](results/raw_attention_weights.gif)
+#### Spatial
+![Spatial Raw Attention Weights](results/spatial_raw_attention_weights.gif)
+
+#### Temporal
+![Temporal Raw Attention Weights](results/temporal_raw_attention_weights.gif)
 
 ### Attention Rollout
-![Attention Rollout](results/attention_rollout.gif)
+#### Spatial
+![Spatial Attention Rollout](results/spatial_attention_rollout.gif)
+
+#### Temporal
+![Temporal Attention Rollout](results/temporal_attention_rollout.gif)
 
 ### Integrated Gradients
 ![Integrated Gradients](results/integrated_gradients.gif)
 
 ### Grad-CAM
-![Grad-CAM](results/grad_cam.gif)
+#### Spatial
+![Spatial Grad-CAM](results/spatial_grad_cam.gif)
+
+#### Temporal
+![Temporal Grad-CAM](results/temporal_grad_cam.gif)
+
+#### Combined
+![Combined Grad-CAM](results/combined_grad_cam.gif)
+
+#### VQ
+![VQ Grad-CAM](results/vq_grad_cam.gif)
 
 ### Occlusion Sensitivity
 ![Occlusion Sensitivity](results/occlusion_sensitivity.gif)

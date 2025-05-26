@@ -18,10 +18,10 @@ The following visualizations demonstrate the model’s response under different 
 
 ### Raw Attention Maps
 #### Spatial
-![Spatial Raw Attention Weights](results/spatial_raw_attention_weights.gif)
+![Spatial Raw Attention Weights](results/spatial_raw_attention_maps.gif)
 
 #### Temporal
-![Temporal Raw Attention Weights](results/temporal_raw_attention_weights.gif)
+![Temporal Raw Attention Weights](results/temporal_raw_attention_maps.gif)
 
 ### Attention Rollout
 #### Spatial

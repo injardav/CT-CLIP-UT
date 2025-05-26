@@ -47,4 +47,5 @@ The following visualizations demonstrate the model’s response under different 
 ![VQ Grad-CAM](results/vq_grad_cam.gif)
 
 ### Occlusion Sensitivity
+coming soon!
 ![Occlusion Sensitivity](results/occlusion_sensitivity.gif)

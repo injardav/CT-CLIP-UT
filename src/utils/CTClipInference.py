@@ -212,10 +212,10 @@ class CTClipInference(nn.Module):
 
         if self.visualize:
             self.vis.visualize(
-                raw_attention_maps=False,
-                attention_rollout=False,
-                integrated_gradients=False,
-                grad_cam=False,
+                raw_attention_maps=True,
+                attention_rollout=True,
+                integrated_gradients=True,
+                grad_cam=True,
                 occlusion=True
             )
             

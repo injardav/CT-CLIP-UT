@@ -538,21 +538,22 @@ class Visualizations():
         temporal_attention_weights = self.saved_outputs.get("temporal_attention_weights")       # torch.Size([576, 8, 24, 24])
 
         # Step 3: Visualize both sets
-        results_dir = self._results_subdirectory("raw_attention_grids")
+        if self.accelerator.is_main_process:
+            results_dir = self._results_subdirectory("raw_attention_grids")
 
-        self.visualize_attention_grid_gif(
-            attention_weights_list=spatial_attention_weights,
-            scan_name=scan_name,
-            save_path=results_dir / f"{scan_name}_spatial_grid.gif",
-            H=24, W=24, tokens_dim='key', mode='spatial'
-        )
+            self.visualize_attention_grid_gif(
+                attention_weights_list=spatial_attention_weights,
+                scan_name=scan_name,
+                save_path=results_dir / f"{scan_name}_spatial_grid.gif",
+                H=24, W=24, tokens_dim='key', mode='spatial'
+            )
 
-        self.visualize_attention_grid_gif(
-            attention_weights_list=temporal_attention_weights,
-            scan_name=scan_name,
-            save_path=results_dir / f"{scan_name}_temporal_grid.gif",
-            H=24, W=24, tokens_dim='key', mode='temporal'
-        )
+            self.visualize_attention_grid_gif(
+                attention_weights_list=temporal_attention_weights,
+                scan_name=scan_name,
+                save_path=results_dir / f"{scan_name}_temporal_grid.gif",
+                H=24, W=24, tokens_dim='key', mode='temporal'
+            )
 
         return
         # Average over heads
@@ -582,9 +583,10 @@ class Visualizations():
         temporal_attention_map = np.rot90(temporal_attention_map, k=-1, axes=(1, 2))
 
         # Visualize
-        results_dir = self._results_subdirectory("raw_attention_maps")
-        self.visualize_overlay(image, spatial_attention_map, scan_name, "Raw Attention Map (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0, display_flags={"heatmap": True, "overlay": True})
-        self.visualize_overlay(image, temporal_attention_map, scan_name, "Raw Attention Map (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0, display_flags={"heatmap": True, "overlay": True})
+        if self.accelerator.is_main_process:
+            results_dir = self._results_subdirectory("raw_attention_maps")
+            self.visualize_overlay(image, spatial_attention_map, scan_name, "Raw Attention Map (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0, display_flags={"heatmap": True, "overlay": True})
+            self.visualize_overlay(image, temporal_attention_map, scan_name, "Raw Attention Map (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0, display_flags={"heatmap": True, "overlay": True})
     
     
     def visualize_attention_grid_gif(self, attention_weights_list, scan_name, save_path, H=24, W=24, tokens_dim='key', mode='spatial'):
@@ -742,7 +744,6 @@ class Visualizations():
         spatial_attention_weights = self.saved_outputs.get("spatial_attention_weights")  # [N_blocks, 8, 576, 576] or List[Tensor]
         temporal_attention_weights = self.saved_outputs.get("temporal_attention_weights")  # [576, 8, 24, 24]
 
-        results_dir = self._results_subdirectory("attention_rollout")
 
         # ---- SPATIAL ROLLOUT ----
         # Assumes spatial_attention_weights is a list of blocks like [24, 8, 576, 576]
@@ -767,7 +768,6 @@ class Visualizations():
         volume = self._upsample(torch.from_numpy(volume), image.shape)
         volume = np.rot90(volume, k=-1, axes=(1, 2))
 
-        self.visualize_overlay(image, volume, scan_name, "Attention Rollout (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0)
 
         # ---- TEMPORAL ROLLOUT ----
         temporal_rollouts = []
@@ -790,7 +790,11 @@ class Visualizations():
         temporal_vol = (temporal_vol - temporal_vol.min()) / (temporal_vol.max() - temporal_vol.min() + 1e-8)
         temporal_vol = self._upsample(torch.from_numpy(temporal_vol), image.shape)
         temporal_vol = np.rot90(temporal_vol, k=-1, axes=(1, 2))
-        self.visualize_overlay(image, temporal_vol, scan_name, "Attention Rollout (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0)
+        
+        if self.accelerator.is_main_process:
+            results_dir = self._results_subdirectory("attention_rollout")
+            self.visualize_overlay(image, volume, scan_name, "Attention Rollout (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0)
+            self.visualize_overlay(image, temporal_vol, scan_name, "Attention Rollout (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0)
 
     def visualize_integrated_gradients(self, image, text_tokens, labels, scan_name, original_scan_path, steps=50):
         # Prepare baseline image
@@ -840,7 +844,7 @@ class Visualizations():
         image = np.rot90(image, k=-1, axes=(1, 2))
         ig = np.rot90(ig, k=-1, axes=(1, 2))
 
-        if self.accelerator.process_index == 0:
+        if self.accelerator.is_main_process:
             results_dir = self._results_subdirectory("integrated_gradients")
             self.visualize_overlay(image, ig, scan_name, "Integrated Gradients (Input)", results_dir / f"{scan_name}.gif", threshold=0.0)
 
@@ -908,7 +912,7 @@ class Visualizations():
         combined_cam_np = np.rot90(combined_cam_np, k=-1, axes=(1, 2))
         vq_cam_np = np.rot90(vq_cam_np, k=-1, axes=(1, 2))
 
-        if self.accelerator.process_index == 0:
+        if self.accelerator.is_main_process:
             results_dir = self._results_subdirectory("grad_cam")
             extra_info = "Text: original\nThreshold: 0.0\nBackprop: rank sim score"
             self.visualize_overlay(image, spatial_cam_np, scan_name, "Grad-CAM (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})

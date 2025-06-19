@@ -212,11 +212,11 @@ class CTClipInference(nn.Module):
 
         if self.visualize:
             self.vis.visualize(
-                raw_attention_maps=True,
-                attention_rollout=True,
+                raw_attention_maps=False,
+                attention_rollout=False,
                 integrated_gradients=True,
-                grad_cam=True,
-                occlusion=True
+                grad_cam=False,
+                occlusion=False
             )
             
         total_time = time.time() - start_time

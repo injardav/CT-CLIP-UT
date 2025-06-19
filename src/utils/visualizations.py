@@ -1,3 +1,4 @@
+import gc
 import time
 import torch
 import random
@@ -243,7 +244,7 @@ class Visualizations():
         """
         Apply interpolation to a 3D tensor input.
         """
-        return F.interpolate(input.unsqueeze(0).unsqueeze(0), size=target_shape, mode="trilinear", align_corners=False).squeeze().detach().cpu().numpy()
+        return F.interpolate(input.unsqueeze(0).unsqueeze(0), size=target_shape, mode="trilinear", align_corners=False).squeeze().detach().cpu().to(torch.float32).numpy()
 
     
     def _broadcast_sample(self, sample, src=0):
@@ -798,7 +799,8 @@ class Visualizations():
 
     def visualize_integrated_gradients(self, image, text_tokens, labels, scan_name, original_scan_path, steps=50):
         # Prepare baseline image
-        baseline = image.mean() * torch.ones_like(image)
+        baseline_value = -1
+        baseline = torch.zeros_like(image) * baseline_value
         baseline = baseline.to(self.accelerator.device)
 
         grads = []
@@ -816,8 +818,11 @@ class Visualizations():
                 loss.backward()
                 loss_values.append(loss)
 
-            print(f"Step {alpha:.2f} | grad mean: {interpolated.grad.abs().mean().item():.6f}, max: {interpolated.grad.abs().max().item():.6f}")
             grads.append(interpolated.grad.detach().clone())  # shape: [1, 1, D, H, W]
+
+            interpolated.grad = None  # clear grad buffer
+            del interpolated  # release tensor
+            torch.cuda.empty_cache()
 
         avg_grads = torch.stack(grads).mean(dim=0)  # [1, 1, D, H, W]
         ig = (diff * avg_grads).squeeze().relu()  # [D, H, W]
@@ -846,7 +851,11 @@ class Visualizations():
 
         if self.accelerator.is_main_process:
             results_dir = self._results_subdirectory("integrated_gradients")
-            self.visualize_overlay(image, ig, scan_name, "Integrated Gradients (Input)", results_dir / f"{scan_name}.gif", threshold=0.0)
+            self.visualize_overlay(image, ig, scan_name, f"Integrated Gradients ({baseline_value})", results_dir / f"{scan_name}.gif", threshold=0.0)
+        
+        del grads, avg_grads, diff, sim_matrix, loss, baseline
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
     def visualize_grad_cam(self, image, text_tokens, labels, scan_name, original_scan_path):
@@ -900,6 +909,7 @@ class Visualizations():
         vq_cam = (vq_cam - vq_cam.min()) / (vq_cam.max() + 1e-8)
 
         # Upsample CAMs
+        image = image.squeeze().cpu()
         spatial_cam_np = self._upsample(spatial_cam, image.shape)
         temporal_cam_np = self._upsample(temporal_cam, image.shape)
         combined_cam_np = self._upsample(combined_cam, image.shape)
@@ -1078,3 +1088,7 @@ class Visualizations():
 
             total_time = time.time() - start_time
             self.maybe_print(f"{name} visualization completed. Time: {str(timedelta(seconds=total_time))}")
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()

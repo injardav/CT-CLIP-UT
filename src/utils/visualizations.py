@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from collections import Counter
 from datetime import timedelta
+from tqdm import tqdm
 
 from scipy.ndimage import gaussian_filter
 import scipy.stats as stats
@@ -20,7 +21,7 @@ from models.ctclip import CTCLIP
 from accelerate import Accelerator
 from pathlib import Path
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers import BertTokenizer
 
 
@@ -53,6 +54,13 @@ COLORS = [
     "turquoise", "indigo"
 ]
 
+SEGMENTABLE_TERMS = [
+    "lymph nodes", "pleural effusion", "ground glass",
+    "lung parenchyma", "right lobe", "left lobe", "upper lobe",
+    "lower lobe", "mediastinal mass", "lung nodules", "bone lesion",
+    "right lung", "left lung", "abdominal organs"
+]
+
 
 def normalize(volume):
     volume = volume - volume.min()
@@ -72,7 +80,7 @@ class Visualizations():
         self,
         model: CTCLIP,
         accelerator: Accelerator,
-        single_dataloader: DataLoader,
+        dataset: Dataset,
         dist_dataloader: DataLoader,
         batch_size: int,
         results_folder: Path,
@@ -81,7 +89,7 @@ class Visualizations():
     ):
         self.model = model.module if hasattr(model, "module") else model
         self.accelerator = accelerator
-        self.single_dataloader = single_dataloader
+        self.dataset = dataset
         self.dist_dataloader = dist_dataloader
         self.batch_size = batch_size
         self.tokenizer = tokenizer
@@ -129,6 +137,9 @@ class Visualizations():
 
     
     def _save_activations_vq(self, module, input, output):
+        """
+        Hook to capture VQ features and gradients.
+        """
         features = output[0]
         self.saved_outputs["vq_features"] = features.detach()
 
@@ -138,41 +149,71 @@ class Visualizations():
         features.register_hook(save_grad)
 
 
-    def _save_activations_spatial(self, module, input, output):
-        features = output[0]
-        self.saved_outputs["spatial_features"] = features.detach()
+    def _save_spatial_layer_outputs(self, module, input, output):
+        """
+        Hook for spatial self-attention layer. Captures:
+        - Feature map (output[0])
+        - Attention weights (output[1])
+        - Gradients of the feature map
+        """
+        feature_map, attn_weights = output
+
+        self.saved_outputs["spatial_features"].append(feature_map.detach())
+        self.saved_outputs["spatial_attention_weights"].append(attn_weights.detach())
 
         def save_grad(grad):
-            self.saved_outputs["spatial_gradients"] = grad
+            self.saved_outputs["spatial_gradients"].append(grad)
 
-        features.register_hook(save_grad)
+        feature_map.register_hook(save_grad)
 
 
-    def _save_activations_temporal(self, module, input, output):
-        features = output[0]
-        self.saved_outputs["temporal_features"] = features.detach()
+    def _save_temporal_layer_outputs(self, module, input, output):
+        """
+        Hook for temporal self-attention layer. Captures:
+        - Feature map (output[0])
+        - Attention weights (output[1])
+        - Gradients of the feature map
+        """
+        feature_map, attn_weights = output
+
+        self.saved_outputs["temporal_features"].append(feature_map.detach())
+        self.saved_outputs["temporal_attention_weights"].append(attn_weights.detach())
 
         def save_grad(grad):
-            self.saved_outputs["temporal_gradients"] = grad
+            self.saved_outputs["temporal_gradients"].append(grad)
 
-        features.register_hook(save_grad)
+        feature_map.register_hook(save_grad)
 
     
     def _register_hooks(self):
         """
-        Create and register forward/backward hooks to capture targeted layer features and gradients.
+        Register forward hooks to capture:
+        - VQ features and gradients
+        - Spatial and temporal attention features, attention weights, and gradients from all layers
         """
-        target_layer = self.model.visual_transformer.vq
-        hook = target_layer.register_forward_hook(self._save_activations_vq)
-        self.hooks.append(hook)
+        # Clear outputs
+        self.saved_outputs["vq_features"] = []
+        self.saved_outputs["spatial_attention_weights"] = []
+        self.saved_outputs["temporal_attention_weights"] = []
+        self.saved_outputs["spatial_features"] = []
+        self.saved_outputs["temporal_features"] = []
+        self.saved_outputs["vq_gradients"] = []
+        self.saved_outputs["spatial_gradients"] = []
+        self.saved_outputs["temporal_gradients"] = []
 
-        target_layer = self.model.visual_transformer.enc_spatial_transformer.layers[-1][1]
-        hook = target_layer.register_forward_hook(self._save_activations_spatial)
-        self.hooks.append(hook)
+        # VQ features and gradients
+        vq_layer = self.model.visual_transformer.vq
+        self.hooks.append(vq_layer.register_forward_hook(self._save_activations_vq))
 
-        target_layer = self.model.visual_transformer.enc_temporal_transformer.layers[-1][1]
-        hook = target_layer.register_forward_hook(self._save_activations_temporal)
-        self.hooks.append(hook)
+        # Register hooks for all spatial self-attention layers
+        for layer in self.model.visual_transformer.enc_spatial_transformer.layers:
+            attn_module = layer[1]
+            self.hooks.append(attn_module.register_forward_hook(self._save_spatial_layer_outputs))
+
+        # Register hooks for all temporal self-attention layers
+        for layer in self.model.visual_transformer.enc_temporal_transformer.layers:
+            attn_module = layer[1]
+            self.hooks.append(attn_module.register_forward_hook(self._save_temporal_layer_outputs))
 
 
     def _remove_hooks(self):
@@ -196,231 +237,59 @@ class Visualizations():
         loss = (loss_i2t + loss_t2i) / 2
 
         return loss
+
+
+    def _upsample(self, input, target_shape):
+        """
+        Apply interpolation to a 3D tensor input.
+        """
+        return F.interpolate(input.unsqueeze(0).unsqueeze(0), size=target_shape, mode="trilinear", align_corners=False).squeeze().detach().cpu().numpy()
+
     
+    def _broadcast_sample(self, sample, src=0):
+        if self.rank == src:
+            sample_list = [x.unsqueeze(0).to(self.accelerator.device) if isinstance(x, torch.Tensor) else [x] for x in sample]
+        else:
+            # Probe structure from rank 0's sample
+            with torch.no_grad():
+                probe_sample = self.dataset[0]
+                sample_list = []
+                for x in probe_sample:
+                    if isinstance(x, torch.Tensor):
+                        empty_tensor = torch.empty((1, *x.shape), dtype=x.dtype, device=self.accelerator.device)
+                        sample_list.append(empty_tensor)
+                    else:
+                        sample_list.append([None])
+
+        for i in range(len(sample_list)):
+            if isinstance(sample_list[i], torch.Tensor):
+                sample_list[i] = sample_list[i].contiguous()
+                torch.distributed.broadcast(sample_list[i], src=src)
+            else:
+                torch.distributed.broadcast_object_list(sample_list[i], src=src)
+
+        return sample_list
+
     
-    def visualize_overlay(self, image, overlay, scan_name, overlay_name, save_path, threshold=0.0, extra_info=""):
+    def _loss_function(self, sim_matrix, targets=None):
         """
-        Creates and saves an animated visualization of a CT scan, an overlay and a combination of both.
-        
-        Args:
-            image (np.array): 3D CT scan image [D, H, W].
-            overlay (np.array): 3D normalized heatmap overlay [D, H, W].
-            scan_name (str): Name of the scan.
-            overlay_name (str): Name of the overlay.
-            save_path (str): Path to save the animation.
+        Compute contrastive loss using similarity matrix.
         """
-        overlay[overlay < threshold] = 0
+        if targets is None:
+            targets = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
 
-        # Set up figure with 3 subplots
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        fig.suptitle(f"Scan: {scan_name}", fontsize=16)
-        ims = []
+        loss_i2t = F.cross_entropy(sim_matrix, targets)
+        loss_t2i = F.cross_entropy(sim_matrix.t(), targets)
+        loss = (loss_i2t + loss_t2i) / 2
 
-        # Add extra text at the top-left corner of the figure
-        if extra_info:
-            fig.text(0.01, 0.98, extra_info, fontsize=12, ha="left", va="top", bbox=dict(facecolor="white", alpha=0.5, edgecolor="black"))
-
-        # Loop over slices to create animation
-        for slice_idx in range(image.shape[0]):
-            # First subplot: Original CT Scan
-            im1 = axes[0].imshow(image[slice_idx, :, :], cmap="bone", animated=True)
-            axes[0].set_title("Original Scan", fontsize=12)
-            axes[0].axis("off")
-
-            # Second subplot: Overlay
-            im2 = axes[1].imshow(overlay[slice_idx, :, :], cmap="inferno", vmin=0, vmax=1, animated=True)
-            axes[1].set_title(f"{overlay_name} Heatmap", fontsize=12)
-            axes[1].axis("off")
-
-            # Third subplot: CT Scan + Overlay
-            im3 = axes[2].imshow(image[slice_idx, :, :], cmap="bone", animated=True)
-            im4 = axes[2].imshow(overlay[slice_idx, :, :], cmap="inferno", alpha=0.6, vmin=0, vmax=1, animated=True)
-            axes[2].set_title("Scan + Heatmap", fontsize=12)
-            axes[2].axis("off")
-
-            ims.append([im1, im2, im3, im4])
-
-        cbar_ax = fig.add_axes([0.35, 0.08, 0.3, 0.02])  # [left, bottom, width, height]
-        cbar = fig.colorbar(im2, cax=cbar_ax, orientation="horizontal")
-        cbar.set_label(f"{overlay_name} Intensity", fontsize=12)
-
-        # Create and save animation
-        ani = animation.ArtistAnimation(fig, ims, interval=100, blit=False, repeat_delay=1000)
-        ani.save(save_path, writer="pillow", fps=10)
-        plt.close(fig)
+        return loss
 
 
-    def visualize_pathology_heatmaps(self, image, heatmaps, save_path, interval=100, figsize=(6, 6)):
-        """
-        Create an animated slice-by-slice overlay of heatmaps with a static legend.
-
-        Parameters:
-            image (ndarray): 3D array (Z, H, W) representing the background image (e.g., CT slices).
-            heatmaps (dict): Dictionary mapping pathology names to 3D arrays (Z, H, W) of activation maps.
-            interval (int): Delay between frames in milliseconds.
-            figsize (tuple): Size of the matplotlib figure.
-        
-        Returns:
-            ani (matplotlib.animation.ArtistAnimation): Animation object.
-        """
-
-        cmaps = {
-            pathology: LinearSegmentedColormap.from_list(
-                f"{pathology.replace(' ', '_')}_cmap",
-                [to_rgba("black", 0.0), to_rgba(color, 1.0)]
-            )
-            for pathology, color in zip(PATHOLOGIES, COLORS)
-        }
-
-        pathology_colors = {
-            pathology: to_hex(to_rgba(color, 1.0))
-            for pathology, color in zip(PATHOLOGIES, COLORS)
-        }
-
-        fig, ax = plt.subplots(figsize=figsize)
-        ims = []
-
-        for slice_idx in range(image.shape[0]):
-            im_frame = []
-
-            # Base CT slice
-            im = ax.imshow(image[slice_idx], cmap="bone", animated=True)
-            im_frame.append(im)
-
-            # Overlay each pathology's heatmap
-            for pathology in heatmaps.keys():
-                imslice = heatmaps[pathology][slice_idx]
-                im2 = ax.imshow(imslice, cmap=cmaps[pathology], vmin=0, vmax=1, alpha=imslice, animated=True)
-                im_frame.append(im2)
-
-            ax.axis("off")
-            ims.append(im_frame)
-
-        legend_elements = [
-            Line2D([0], [0], color=pathology_colors[pathology], lw=2, label=pathology)
-            for pathology in heatmaps.keys()
-        ]
-        ax.legend(handles=legend_elements, loc='upper right', fontsize='small', frameon=True)
-
-        ani = animation.ArtistAnimation(fig, ims, interval=interval, blit=False, repeat_delay=1000)
-        ani.save(save_path, writer="pillow", fps=10)
-        plt.close(fig)
-    
-    
-    def visualize_integrated_gradients(self, image, text_tokens, labels, scan_name, original_scan_path, steps=50):
-        blurred_np = gaussian_filter(image.squeeze().cpu().numpy(), sigma=5.0)
-        baseline_image = torch.from_numpy(blurred_np).unsqueeze(0).unsqueeze(0).to(self.accelerator.device)
-        self._register_hooks()
-
-        _ = self.model(text_tokens, image)
-        real_features = self.saved_outputs["vq_features"].view(-1, 512)
-
-        _ = self.model(text_tokens, baseline_image)
-        baseline_features = self.saved_outputs["vq_features"].view(-1, 512)
-
-        grads = []
-        image_diff = image - baseline_image
-
-        for alpha in torch.linspace(0, 1, steps).to(self.accelerator.device):
-            interpolated_input = baseline_image + alpha * image_diff
-            interpolated_input.requires_grad = True
-
-            # Forward + backward
-            with torch.enable_grad():
-                sim_matrix, *_ = self.model(text_tokens, interpolated_input)
-                sim_matrix[self.rank, self.rank].backward()
-
-            grads.append(self.saved_outputs["vq_gradients"].clone())
-
-        self._remove_hooks()
-        avg_gradients = torch.stack(grads).mean(dim=0)  # shape: [24*24*24, 512]
-        integrated_grads = (real_features - baseline_features) * avg_gradients
-        original_image = self._read_nii_data(original_scan_path).squeeze()
-
-        cam = integrated_grads.sum(dim=-1).relu()
-        cam = (cam - cam.min()) / (cam.max() + 1e-8)
-        cam = cam.view(24, 24, 24)
-
-        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0),
-                            size=original_image.shape,
-                            mode='trilinear',
-                            align_corners=False).squeeze(0).squeeze(0)
-        cam = cam.detach().cpu().numpy()
-
-        original_image = np.rot90(original_image, k=-1, axes=(1, 2))
-        cam = np.rot90(cam, k=-1, axes=(1, 2))
-
-        if self.accelerator.process_index == 0:
-            results_dir = self._results_subdirectory("integrated_gradients")
-            extra_info = "Text: original\nThreshold: 0.0\nIG steps: {}\nBaseline: -1".format(steps)
-            self.visualize_overlay(original_image, cam, scan_name, "Integrated Gradients", results_dir / f"{scan_name}.gif", threshold=0.0, extra_info=extra_info)
-
-
-    def visualize_grad_cam(self, image, text_tokens, labels, scan_name, original_scan_path):
-        """
-        Use spatial feature maps and gradients obtained from hooks to construct class activation maps (cams).
-        Visualize these cams by overlaying them on top of the original CT scan.
-        """
-        self._register_hooks()
-        with torch.enable_grad():
-            sim_matrix, *_ = self.model(text_tokens, image)
-            sim_matrix[self.rank, self.rank].backward()
-        self._remove_hooks()
-
-        original_image = self._read_nii_data(original_scan_path).squeeze()      # torch.Size([240, 480, 480])
-
-        # spatial_features = self.saved_outputs.get("spatial_features").view(-1, 512)             # torch.Size([24, 576, 512]) --> torch.Size([13824, 512])
-        # temporal_features = self.saved_outputs.get("temporal_features").view(-1, 512)             # torch.Size([24, 576, 512]) --> torch.Size([13824, 512])
-
-        # spatial_gradients = self.saved_outputs.get("spatial_gradients").view(-1, 512)           # torch.Size([24, 576, 512]) --> torch.Size([13824, 512])
-        # temporal_gradients = self.saved_outputs.get("temporal_gradients").view(-1, 512)           # torch.Size([24, 576, 512]) --> torch.Size([13824, 512])
-
-        # spatial_gradients = spatial_gradients.mean(dim=0, keepdim=True)
-        # temporal_gradients = temporal_gradients.mean(dim=0, keepdim=True)
-
-        # spatial_cam = (spatial_gradients * spatial_features).sum(dim=-1).relu()
-        # temporal_cam = (temporal_gradients * temporal_features).sum(dim=-1).relu()
-
-        # spatial_cam = (spatial_cam - spatial_cam.min()) / (spatial_cam.max() + 1e-8)
-        # temporal_cam = (temporal_cam - temporal_cam.min()) / (temporal_cam.max() + 1e-8)
-
-        # cam = torch.sqrt(spatial_cam * temporal_cam + 1e-8)
-
-        features = self.saved_outputs.get("vq_features").view(-1, 512)
-        gradients = self.saved_outputs.get("vq_gradients").view(-1, 512).mean(dim=0, keepdim=True)
-        
-        cam = (gradients * features).sum(dim=-1)
-        cam = cam.relu()
-        cam = (cam - cam.min()) / (cam.max() + 1e-8)
-        cam = cam.view(24, 24, 24)
-
-        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0),
-                            size=original_image.shape,
-                            mode='trilinear',
-                            align_corners=False).squeeze(0).squeeze(0)
-        cam = cam.detach().cpu().numpy()
-
-        original_image = np.rot90(original_image, k=-1, axes=(1, 2))
-        cam = np.rot90(cam, k=-1, axes=(1, 2))
-
-        if self.accelerator.process_index == 0:
-            results_dir = self._results_subdirectory("grad_cam")
-            extra_info = "Text: original\nThreshold: 0.0\nBackprop: rank sim score"
-            self.visualize_overlay(original_image, cam, scan_name, "Grad-CAM", results_dir / f"{scan_name}.gif", threshold=0.0, extra_info=extra_info)
-
-
-    def visualize_occlusion_sensitivity(self, image, text_tokens, labels, scan_name, original_scan_path, patch_size=(20,40,40), stride=(20,40,40)):
-        arithmetic_embeds = np.load(self.diff_embeds_folder, allow_pickle=True)
-        arithmetic_embeds = arithmetic_embeds.item()
-        tensor_embeds = {k: torch.tensor(v, dtype=torch.float32).to(self.accelerator.device).unsqueeze(0) for k, v in arithmetic_embeds.items()}
-
-        original_image = self._read_nii_data(original_scan_path)
-        _, _, D, H, W = image.shape
-        threshold = 0.5
-
+    def _compute_occlusion(self, image, text_tokens, text_embeds, patch_size, stride, threshold):
         # Divide Depth (D) among GPUs
         # Each GPU is responsible for a subset of the depth slices (D)
         # This part is needed if occlusion is run with multiple GPU's
+        _, _, D, H, W = image.shape
         d_coords = range(0, D - patch_size[0] + 1, stride[0])
         h_coords = range(0, H - patch_size[1] + 1, stride[1])
         w_coords = range(0, W - patch_size[2] + 1, stride[2])
@@ -447,79 +316,660 @@ class Visualizations():
         total_patches = len(patch_coords)
         print(f"[Rank {self.rank}] Total patches to go through: {total_patches}")
 
-        start_time = time.time()
+        heatmap = np.zeros((D, H, W))
+        count_map = np.zeros((D, H, W))
 
-        positive_indices = (labels == 1).nonzero(as_tuple=True)[0]
-        positive_pathologies = [PATHOLOGIES[i] for i in positive_indices.tolist()]
+        # Compute original similarity score (before occlusion)
+        with torch.no_grad():
+            if isinstance(text_embeds, torch.Tensor) and text_embeds.ndim > 1:
+                original_sim_matrix, *_ = self.model(None, image, text_embeds)
+            else:
+                original_sim_matrix, *_ = self.model(text_tokens, image)
+            original_score = original_sim_matrix[self.rank, self.rank].item()
+
+        # Iterate through the assigned patch coordinates and occlude voxel windows
+        start_time = time.time()
+        for idx, (d, h, w) in enumerate(patch_coords):
+            occluded_image = image.clone().detach()
+            occluded_image[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = -1
+
+            if isinstance(text_embeds, torch.Tensor) and text_embeds.ndim > 1:
+                occluded_sim_matrix, *_ = self.model(None, occluded_image, text_embeds)
+            else:
+                occluded_sim_matrix, *_ = self.model(text_tokens, occluded_image)
+
+            occluded_score = occluded_sim_matrix[self.rank, self.rank].item()
+
+            importance = max(original_score - occluded_score, 0)
+            heatmap[d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] += importance
+            count_map[d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] += 1
+
+            if idx % 100 == 0 or idx == total_patches - 1:
+                elapsed = time.time() - start_time
+                avg_time_per_patch = elapsed / (idx + 1)
+                remaining_time = avg_time_per_patch * (total_patches - (idx + 1))
+                percent_done = 100.0 * (idx + 1) / total_patches
+
+                print(f"[Rank {self.rank}] Patch {idx + 1}/{total_patches} "
+                    f"({percent_done:.2f}%) - Elapsed: {elapsed:.1f}s - ETA: {remaining_time:.1f}s")
+
+
+        heatmap_tensor = torch.tensor(heatmap, dtype=torch.float32, device=self.accelerator.device)
+        count_tensor = torch.tensor(count_map, dtype=torch.float32, device=self.accelerator.device)
+
+        if self.world_size > 1:
+            dist.reduce(heatmap_tensor, dst=0, op=dist.ReduceOp.SUM)
+            dist.reduce(count_tensor, dst=0, op=dist.ReduceOp.SUM)
+
+        if self.accelerator.is_main_process:
+            count_tensor[count_tensor == 0] = 1
+            heatmap_tensor = heatmap_tensor / count_tensor
+            heatmap_tensor = (heatmap_tensor - heatmap_tensor.min()) / (heatmap_tensor.max() - heatmap_tensor.min() + 1e-8)
+
+            full_heatmap = heatmap_tensor.unsqueeze(0).unsqueeze(0)
+            full_heatmap = F.interpolate(full_heatmap,
+                            size=(D, H, W),
+                            mode='trilinear',
+                            align_corners=False).squeeze(0).squeeze(0)
+            full_heatmap = full_heatmap.detach().cpu().numpy()
+            full_heatmap[full_heatmap < threshold] = 0
+            full_heatmap = np.rot90(full_heatmap, k=-1, axes=(1, 2))
+            return full_heatmap
+    
+    
+    def visualize_overlay(self, image, overlay, scan_name, overlay_name, save_path,
+                      threshold=0.0, extra_info="", display_flags=None):
+        """
+        Creates and saves an animated visualization of a CT scan with selectable views.
+        
+        Args:
+            image (np.array): 3D CT scan image [D, H, W].
+            overlay (np.array): 3D normalized heatmap overlay [D, H, W].
+            scan_name (str): Name of the scan.
+            overlay_name (str): Name of the overlay.
+            save_path (str): Path to save the animation.
+            threshold (float): Minimum value in overlay to be visualized.
+            extra_info (str): Extra text to display on the figure.
+            display_flags (dict): Keys = {"original", "heatmap", "overlay"}, values = bool.
+        """
+        if display_flags is None:
+            display_flags = {"original": True, "heatmap": True, "overlay": True}
+
+        overlay = np.copy(overlay)
+        overlay[overlay < threshold] = 0
+
+        view_order = []
+        if display_flags.get("original"): view_order.append("original")
+        if display_flags.get("heatmap"):  view_order.append("heatmap")
+        if display_flags.get("overlay"):  view_order.append("overlay")
+
+        fig, axes = plt.subplots(1, len(view_order), figsize=(6 * len(view_order), 6))
+        if len(view_order) == 1:
+            axes = [axes]
+
+        fig.suptitle(f"Scan: {scan_name}", fontsize=16)
+        ims = []
+
+        if extra_info:
+            fig.text(0.00, 0.99, extra_info, fontsize=10, ha="left", va="top")
+
+        for slice_idx in range(image.shape[0]):
+            frame_images = []
+
+            for ax, view in zip(axes, view_order):
+                if view == "original":
+                    im = ax.imshow(image[slice_idx], cmap="bone", animated=True)
+                    ax.set_title("Original Scan", fontsize=12)
+                    frame_images.append(im)
+                elif view == "heatmap":
+                    im = ax.imshow(overlay[slice_idx], cmap="inferno", vmin=0, vmax=1, animated=True)
+                    ax.set_title(f"{overlay_name} Heatmap", fontsize=12)
+                    frame_images.append(im)
+                elif view == "overlay":
+                    im1 = ax.imshow(image[slice_idx], cmap="bone", animated=True)
+                    im2 = ax.imshow(overlay[slice_idx], cmap="inferno", alpha=overlay[slice_idx], vmin=0, vmax=1, animated=True)
+                    ax.set_title("Scan + Heatmap", fontsize=12)
+                    frame_images.extend([im1, im2])
+                ax.axis("off")
+
+            ims.append(frame_images)
+
+        if "heatmap" in view_order:
+            cbar_ax = fig.add_axes([0.35, 0.08, 0.3, 0.02])
+            cbar = fig.colorbar(ims[0][view_order.index("heatmap")], cax=cbar_ax, orientation="horizontal")
+            cbar.set_label(f"{overlay_name} Intensity", fontsize=12)
+
+        ani = animation.ArtistAnimation(fig, ims, interval=100, blit=False, repeat_delay=1000)
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        ani.save(save_path, writer="pillow", fps=10)
+        plt.close(fig)
+
+
+    def visualize_pathology_heatmaps(self, image, heatmaps, save_path, interval=100, figsize=None):
+        """
+        Create an animated slice-by-slice grid:
+        For each pathology, display a row with:
+        [Original scan | Heatmap only | Scan + Heatmap overlay]
+
+        Parameters:
+            image (ndarray): 3D array (Z, H, W) representing the background image (e.g., CT slices).
+            heatmaps (dict): Dictionary mapping pathology names to 3D arrays (Z, H, W) of activation maps.
+            interval (int): Delay between frames in milliseconds.
+            figsize (tuple): Size of the matplotlib figure.
+
+        Returns:
+            ani (matplotlib.animation.ArtistAnimation): Animation object.
+        """
+
+        if figsize is None:
+            figsize = (12, 4 * len(heatmaps))
+
+        cmaps = {
+            pathology: LinearSegmentedColormap.from_list(
+                f"{pathology.replace(' ', '_')}_cmap",
+                [to_rgba("black", 0.0), to_rgba(color, 1.0)]
+            )
+            for pathology, color in zip(PATHOLOGIES, COLORS)
+        }
+
+        fig, axes = plt.subplots(nrows=len(heatmaps), ncols=3, figsize=figsize)
+        if len(heatmaps) == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        ims = []
+
+        num_slices = image.shape[0]
+        pbar = tqdm(total=num_slices, desc="Generating frames", unit="slice", mininterval=10.0)
+
+        start_time = time.time()
+        for slice_idx in range(num_slices):
+            im_frame = []
+
+            for row_idx, (pathology, heatmap) in enumerate(heatmaps.items()):
+                slice_img = image[slice_idx]
+                slice_heatmap = heatmap[slice_idx]
+
+                # Original scan
+                im1 = axes[row_idx, 0].imshow(slice_img, cmap="bone", animated=True)
+                axes[row_idx, 0].set_title(f"{pathology} - Scan", fontsize=8)
+                im_frame.append(im1)
+
+                # Heatmap
+                im2 = axes[row_idx, 1].imshow(slice_heatmap, cmap=cmaps[pathology], vmin=0, vmax=1, animated=True)
+                axes[row_idx, 1].set_title(f"{pathology} - Heatmap", fontsize=8)
+                im_frame.append(im2)
+
+                # Overlay
+                im3a = axes[row_idx, 2].imshow(slice_img, cmap="bone", animated=True)
+                im3b = axes[row_idx, 2].imshow(slice_heatmap, cmap=cmaps[pathology], vmin=0, vmax=1, alpha=slice_heatmap, animated=True)
+                axes[row_idx, 2].set_title(f"{pathology} - Overlay", fontsize=8)
+                im_frame.extend([im3a, im3b])
+
+            for ax in axes.flatten():
+                ax.axis("off")
+
+            ims.append(im_frame)
+            pbar.update(1)
+
+        pbar.close()
+        elapsed = time.time() - start_time
+        print(f"Animation rendering complete in {elapsed:.2f} seconds.")
+
+        ani = animation.ArtistAnimation(fig, ims, interval=interval, blit=False, repeat_delay=1000)
+        ani.save(save_path, writer="pillow", fps=10)
+        plt.close(fig)
+
+
+    def visualize_raw_attention_maps(self, image, text_tokens, labels, scan_name, original_scan_path):
+        """
+        Visualize per-layer, per-head attention as a grid. Each row is a head, each column a layer.
+        Saves as a GIF cycling through slices along depth.
+        """
+        
+        # Activate hooks, run forward pass and backpropagate from sim score
+        self._register_hooks()
+        with torch.enable_grad():
+            sim_matrix, *_ = self.model(text_tokens, image)
+            sim_matrix[self.rank, self.rank].backward()
+        self._remove_hooks()
+
+        # Access and process attention maps
+        spatial_attention_weights = self.saved_outputs.get("spatial_attention_weights")         # torch.Size([24, 8, 576, 576])
+        temporal_attention_weights = self.saved_outputs.get("temporal_attention_weights")       # torch.Size([576, 8, 24, 24])
+
+        # Step 3: Visualize both sets
+        results_dir = self._results_subdirectory("raw_attention_grids")
+
+        self.visualize_attention_grid_gif(
+            attention_weights_list=spatial_attention_weights,
+            scan_name=scan_name,
+            save_path=results_dir / f"{scan_name}_spatial_grid.gif",
+            H=24, W=24, tokens_dim='key', mode='spatial'
+        )
+
+        self.visualize_attention_grid_gif(
+            attention_weights_list=temporal_attention_weights,
+            scan_name=scan_name,
+            save_path=results_dir / f"{scan_name}_temporal_grid.gif",
+            H=24, W=24, tokens_dim='key', mode='temporal'
+        )
+
+        return
+        # Average over heads
+        spatial_attn_avg = spatial_attention_weights.mean(dim=1)  # [24, 576, 576]
+        temporal_attn_avg = temporal_attention_weights.mean(dim=1)  # [576, 24, 24]
+
+        # Sum over query dimension -> attention *received* by each key token
+        spatial_received = spatial_attn_avg.sum(dim=1)  # [24, 576]
+        temporal_received = temporal_attn_avg.sum(dim=1)  # [576, 24]
+
+        # Reshape: 576 -> H*W
+        H, W = 24, 24
+        spatial_attention_map = spatial_received.view(24, H, W)  # [D, H, W]
+        temporal_attention_map = temporal_received.transpose(0, 1).view(24, H, W)
+
+        # Normalize
+        spatial_attention_map = (spatial_attention_map - spatial_attention_map.min()) / (spatial_attention_map.max() + 1e-8)
+        temporal_attention_map = (temporal_attention_map - temporal_attention_map.min()) / (temporal_attention_map.max() + 1e-8)
+
+        # Upsample and rotate attention maps
+        image = image.squeeze().cpu().numpy()
+        spatial_attention_map = self._upsample(spatial_attention_map, image.shape)
+        temporal_attention_map = self._upsample(temporal_attention_map, image.shape)
+
+        image = np.rot90(image, k=-1, axes=(1, 2))
+        spatial_attention_map = np.rot90(spatial_attention_map, k=-1, axes=(1, 2))
+        temporal_attention_map = np.rot90(temporal_attention_map, k=-1, axes=(1, 2))
+
+        # Visualize
+        results_dir = self._results_subdirectory("raw_attention_maps")
+        self.visualize_overlay(image, spatial_attention_map, scan_name, "Raw Attention Map (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0, display_flags={"heatmap": True, "overlay": True})
+        self.visualize_overlay(image, temporal_attention_map, scan_name, "Raw Attention Map (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0, display_flags={"heatmap": True, "overlay": True})
+    
+    
+    def visualize_attention_grid_gif(self, attention_weights_list, scan_name, save_path, H=24, W=24, tokens_dim='key', mode='spatial'):
+        """
+        Visualize per-layer, per-head attention as a grid. Each row is a head, each column a layer.
+        Saves as a GIF cycling through slices along depth (spatial) or spatial locations (temporal).
+
+        Args:
+            attention_weights_list: List[Tensor], each of shape:
+                - spatial: [24, 8, 576, 576]
+                - temporal: [576, 8, 24, 24]
+            scan_name (str): Scan identifier for title
+            save_path (Path): Where to save the GIF
+            H, W (int): Spatial dimensions (default 24×24)
+            tokens_dim (str): 'key' to visualize attention received, 'query' for attention sent
+            mode (str): 'spatial' or 'temporal'
+        """
+        num_layers = len(attention_weights_list)
+        num_heads = attention_weights_list[0].shape[1]
+        D = 24  # depth
+
+        attention_volumes = [[None for _ in range(num_layers)] for _ in range(num_heads)]
+
+        for layer_idx, attn in enumerate(attention_weights_list):  # loop over layers
+            for head in range(num_heads):
+                if mode == 'spatial':
+                    # attn: [D, H, Q, K] → [D, Q, K]
+                    received = attn[:, head].sum(dim=1)  # sum over queries → [D, K]
+                    vol = received.view(D, H, W)  # [D, 24, 24]
+                elif mode == 'temporal':
+                    vol = torch.zeros((24, 24, 24), device=attn.device)  # [D, H, W]
+                    for i in range(576):
+                        h_idx = i // 24
+                        w_idx = i % 24
+                        received = attn[i, head].sum(dim=0)  # [24]
+                        vol[:, h_idx, w_idx] = received  # OK: [24] assigned into [:, h, w]
+
+                vol = (vol - vol.min()) / (vol.max() + 1e-8)
+                vol = vol.cpu().numpy()
+                vol = np.rot90(vol, k=-1, axes=(0, 1))
+                attention_volumes[head][layer_idx] = vol
+
+        fig, axes = plt.subplots(num_heads, num_layers, figsize=(4*num_layers, 3*num_heads))
+        
+        if num_layers == 1:
+            axes = [axes]
+
+        ims = []
+
+        for d in range(D):
+            frame = []
+            for i in range(num_heads):
+                for j in range(num_layers):
+                    ax = axes[i][j]
+                    img = attention_volumes[i][j][d]
+                    im = ax.imshow(img, cmap='inferno', vmin=0, vmax=1, animated=True)
+                    if i == 0:
+                        ax.set_title(f"Layer {j}", fontsize=10)
+                    if j == 0:
+                        ax.set_ylabel(f"Head {i}", fontsize=10)
+                    frame.append(im)
+                    ax.axis("off")
+            ims.append(frame)
+
+        ani = animation.ArtistAnimation(fig, ims, interval=100, blit=False, repeat_delay=1000)
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        ani.save(str(save_path), writer="pillow", fps=6)
+        plt.close(fig)
+
+
+    def attention_rollout(self, attn_weights_list, head_fusion='mean', discard_ratio=0.0, use_residual=True):
+        """
+        Attention rollout with optional residual connection (skip connection) handling.
+        
+        Args:
+            attn_weights_list: List of attention matrices, each [Heads, Tokens, Tokens]
+            head_fusion: 'mean' or 'max'
+            discard_ratio: fraction of lowest weights to discard
+            use_residual: whether to include identity skip connection at each layer
+
+        Returns:
+            rollout: [Tokens, Tokens] final attribution map
+        """
+        result = torch.eye(attn_weights_list[0].size(-1)).to(attn_weights_list[0].device)
+        for attn in attn_weights_list:
+            if head_fusion == 'mean':
+                attn = attn.mean(dim=0)  # [Tokens, Tokens]
+            elif head_fusion == 'max':
+                attn = attn.max(dim=0)[0]
+            else:
+                raise ValueError(f"Unsupported head_fusion: {head_fusion}")
+
+            if discard_ratio > 0:
+                flat = attn.view(attn.shape[0], -1)
+                num_discard = int(flat.shape[1] * discard_ratio)
+                threshold = flat.topk(flat.shape[1] - num_discard, dim=1)[0].min(dim=1, keepdim=True)[0]
+                attn = torch.where(attn >= threshold, attn, torch.zeros_like(attn))
+
+            attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-8)
+
+            if use_residual:
+                attn = attn + torch.eye(attn.size(0)).to(attn.device)
+                attn = attn / attn.sum(dim=-1, keepdim=True)
+
+            result = attn @ result
+
+        return result
+
+    def attention_rollout_3d(self, attn_weights_list, D=24, H=24, W=24, head_fusion='mean',
+                         discard_ratio=0.0, mode='spatial', use_residual=True):
+        """
+        Convert attention rollout into 3D attribution volume.
+
+        Args:
+            attn_weights_list: List of attention maps [Heads, Tokens, Tokens]
+            D, H, W: Volume dimensions
+            mode: 'spatial' or 'temporal'
+            use_residual: Include residual connection in rollout
+
+        Returns:
+            np.ndarray: [D, H, W] attention volume
+        """
+        rollout = self.attention_rollout(attn_weights_list, head_fusion, discard_ratio, use_residual)
+
+        if mode == 'spatial':
+            attention_1d = rollout.sum(dim=0)  # [576]
+            assert attention_1d.shape[0] == H * W, f"Expected {H*W}, got {attention_1d.shape}"
+            volume_2d = attention_1d.view(H, W).cpu().numpy()
+            volume = np.stack([volume_2d for _ in range(D)], axis=0)  # [D, H, W]
+
+        elif mode == 'temporal':
+            attention_1d = rollout.sum(dim=0)
+            assert attention_1d.shape[0] == D, f"Expected {D}, got {attention_1d.shape}"
+            volume = np.stack([np.full((H, W), v.item()) for v in attention_1d], axis=0)
+
+        else:
+            raise ValueError("Mode must be 'spatial' or 'temporal'.")
+
+        volume = volume / (volume.max() + 1e-8)
+        return volume
+
+
+    def visualize_attention_rollout(self, image, text_tokens, labels, scan_name, original_scan_path):
+        """
+        Runs attention rollout from sim score and saves 3D attribution maps as animations.
+        """
+        self._register_hooks()
+        with torch.enable_grad():
+            sim_matrix, *_ = self.model(text_tokens, image)
+            sim_matrix[self.rank, self.rank].backward()
+        self._remove_hooks()
+        image = image.squeeze().cpu().numpy()
+        image = np.rot90(image, k=-1, axes=(1, 2))
+
+        spatial_attention_weights = self.saved_outputs.get("spatial_attention_weights")  # [N_blocks, 8, 576, 576] or List[Tensor]
+        temporal_attention_weights = self.saved_outputs.get("temporal_attention_weights")  # [576, 8, 24, 24]
+
+        results_dir = self._results_subdirectory("attention_rollout")
+
+        # ---- SPATIAL ROLLOUT ----
+        # Assumes spatial_attention_weights is a list of blocks like [24, 8, 576, 576]
+        D, H, W = 24, 24, 24
+        spatial_rollouts = []
+
+        for attn_block in spatial_attention_weights:  # each [24, 8, 576, 576]
+            for d in range(attn_block.shape[0]):  # 24 depth slices
+                slice_attn = attn_block[d]  # [8, 576, 576]
+                rollout = self.attention_rollout(
+                    [slice_attn],  # treat each depth slice as a "layer"
+                    head_fusion='mean',
+                    discard_ratio=0.0,
+                    use_residual=True
+                )
+                attention_1d = rollout.sum(dim=0)  # [576]
+                spatial_rollouts.append(attention_1d.view(H, W).cpu().numpy())  # [24, 24]
+
+        # Now stack into a volume: [24, 24, 24] = [D, H, W]
+        volume = np.stack(spatial_rollouts, axis=0)
+        volume = (volume - volume.min()) / (volume.max() - volume.min() + 1e-8)
+        volume = self._upsample(torch.from_numpy(volume), image.shape)
+        volume = np.rot90(volume, k=-1, axes=(1, 2))
+
+        self.visualize_overlay(image, volume, scan_name, "Attention Rollout (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0)
+
+        # ---- TEMPORAL ROLLOUT ----
+        temporal_rollouts = []
+        num_tokens = temporal_attention_weights[0].shape[0]  # assumes consistent shape
+        for token_idx in range(num_tokens):
+            # Extract temporal attention per layer for this token
+            token_attn_layers = [layer[token_idx] for layer in temporal_attention_weights]  # List[8, 24, 24]
+
+            # Run attention rollout over the temporal layers for this token
+            rollout = self.attention_rollout(
+                token_attn_layers,  # Each [8, 24, 24]
+                head_fusion='mean',
+                discard_ratio=0.0,
+                use_residual=True
+            )
+            temporal_rollouts.append(rollout.sum(dim=0))  # [24] token importance over time
+
+        temporal_avg = torch.stack(temporal_rollouts).mean(dim=0)  # [24]
+        temporal_vol = np.stack([np.full((24, 24), v.item()) for v in temporal_avg], axis=0)
+        temporal_vol = (temporal_vol - temporal_vol.min()) / (temporal_vol.max() - temporal_vol.min() + 1e-8)
+        temporal_vol = self._upsample(torch.from_numpy(temporal_vol), image.shape)
+        temporal_vol = np.rot90(temporal_vol, k=-1, axes=(1, 2))
+        self.visualize_overlay(image, temporal_vol, scan_name, "Attention Rollout (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0)
+
+    def visualize_integrated_gradients(self, image, text_tokens, labels, scan_name, original_scan_path, steps=50):
+        # Prepare baseline image
+        baseline = image.mean() * torch.ones_like(image)
+        baseline = baseline.to(self.accelerator.device)
+
+        grads = []
+        diff = image - baseline
+
+        loss_values = []
+        for alpha in torch.linspace(0, 1, steps).to(self.accelerator.device):
+            interpolated = baseline + alpha * diff
+            interpolated = interpolated.detach().requires_grad_()
+
+            self.model.zero_grad()
+            with torch.enable_grad():
+                sim_matrix, *_ = self.model(text_tokens, interpolated)  # shape: [B, B]
+                loss = sim_matrix[self.rank, self.rank]  # scalar
+                loss.backward()
+                loss_values.append(loss)
+
+            print(f"Step {alpha:.2f} | grad mean: {interpolated.grad.abs().mean().item():.6f}, max: {interpolated.grad.abs().max().item():.6f}")
+            grads.append(interpolated.grad.detach().clone())  # shape: [1, 1, D, H, W]
+
+        avg_grads = torch.stack(grads).mean(dim=0)  # [1, 1, D, H, W]
+        ig = (diff * avg_grads).squeeze().relu()  # [D, H, W]
+
+        # Normalize
+        ig = (ig - ig.min()) / (ig.max() + 1e-8)
+        ig = ig.cpu().numpy()
+
+        # Threshold out bottom quantile
+        q_thresh = np.quantile(ig, 0.90)
+        ig = np.where(ig >= q_thresh, ig, 0.0)
+
+        # Apply contrast amplification to entire map (including zeros)
+        ig = ig ** 0.05
+
+        # Normalize again to stretch full range, including zeros
+        ig = ig / (ig.max() + 1e-8)
+
+        # threshold = np.quantile(ig_np, 0.99)
+        # ig_np[ig_np < threshold] = 0
+
+        # Rotate
+        image = image.squeeze().cpu().numpy()
+        image = np.rot90(image, k=-1, axes=(1, 2))
+        ig = np.rot90(ig, k=-1, axes=(1, 2))
+
+        if self.accelerator.process_index == 0:
+            results_dir = self._results_subdirectory("integrated_gradients")
+            self.visualize_overlay(image, ig, scan_name, "Integrated Gradients (Input)", results_dir / f"{scan_name}.gif", threshold=0.0)
+
+
+    def visualize_grad_cam(self, image, text_tokens, labels, scan_name, original_scan_path):
+        """
+        Use spatial feature maps and gradients obtained from hooks to construct class activation maps (cams).
+        Visualize these cams by overlaying them on top of the original CT scan.
+        """
+        self._register_hooks()
+        with torch.enable_grad():
+            sim_matrix, *_ = self.model(text_tokens, image)
+            sim_matrix[self.rank, self.rank].backward()
+        self._remove_hooks()
+
+        # Extract feature maps and gradients in [T, H*W, D] shape
+        spatial_features = self.saved_outputs.get("spatial_features")[-1]                           # torch.Size([24, 576, 512])
+        temporal_features = self.saved_outputs.get("temporal_features")[-1]                         # torch.Size([24, 576, 512])
+
+        # Average over the embedding dimension to get weights
+        spatial_gradients = self.saved_outputs.get("spatial_gradients")[-1].mean(dim=(0, 1))         # torch.Size([512])
+        temporal_gradients = self.saved_outputs.get("temporal_gradients")[-1].mean(dim=(0, 1))       # torch.Size([512])
+
+        # Compute CAMs
+        spatial_cam = (spatial_features * spatial_gradients.view(1, 1, -1)).sum(dim=-1).relu()
+        temporal_cam = (temporal_features * temporal_gradients.view(1, 1, -1)).sum(dim=-1).relu()
+
+        # Reshape flattened spatial CAMs to 3D volumes
+        spatial_cam = spatial_cam.view(24, 24, 24)
+        temporal_cam = temporal_cam.view(24, 24, 24)
+
+        # Normalize
+        spatial_cam = (spatial_cam - spatial_cam.min()) / (spatial_cam.max() + 1e-8)
+        temporal_cam = (temporal_cam - temporal_cam.min()) / (temporal_cam.max() + 1e-8)
+
+        # Combine both CAMs multiplicatively (element-wise)
+        combined_cam = torch.sqrt(spatial_cam * temporal_cam + 1e-8)
+
+        # Flattened input: [1, 13824, 512]
+        vq_features = self.saved_outputs["vq_features"][-1].squeeze(0)     # [13824, 512]
+        vq_gradients = self.saved_outputs["vq_gradients"][-1].squeeze(0)   # [13824, 512]
+
+        # Step 1: Get per-channel importance weights
+        weights = vq_gradients.mean(dim=0)  # [512]
+
+        # Step 2: Apply weights and sum over channels
+        vq_cam = (vq_features * weights).sum(dim=-1).relu()  # [13824]
+
+        # Step 3: Reshape to 3D volume
+        vq_cam = vq_cam.view(24, 24, 24)
+
+        # Step 4: Normalize
+        vq_cam = (vq_cam - vq_cam.min()) / (vq_cam.max() + 1e-8)
+
+        # Upsample CAMs
+        spatial_cam_np = self._upsample(spatial_cam, image.shape)
+        temporal_cam_np = self._upsample(temporal_cam, image.shape)
+        combined_cam_np = self._upsample(combined_cam, image.shape)
+        vq_cam_np = self._upsample(vq_cam, image.shape)
+
+        # Rotate 90 degrees so CT table is down
+        image = np.rot90(image, k=-1, axes=(1, 2))
+        spatial_cam_np = np.rot90(spatial_cam_np, k=-1, axes=(1, 2))
+        temporal_cam_np = np.rot90(temporal_cam_np, k=-1, axes=(1, 2))
+        combined_cam_np = np.rot90(combined_cam_np, k=-1, axes=(1, 2))
+        vq_cam_np = np.rot90(vq_cam_np, k=-1, axes=(1, 2))
+
+        if self.accelerator.process_index == 0:
+            results_dir = self._results_subdirectory("grad_cam")
+            extra_info = "Text: original\nThreshold: 0.0\nBackprop: rank sim score"
+            self.visualize_overlay(image, spatial_cam_np, scan_name, "Grad-CAM (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
+            self.visualize_overlay(image, temporal_cam_np, scan_name, "Grad-CAM (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
+            self.visualize_overlay(image, combined_cam_np, scan_name, "Grad-CAM (Combined)", results_dir / f"{scan_name}_combined.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
+            self.visualize_overlay(image, vq_cam_np, scan_name, "Grad-CAM (VQ)", results_dir / f"{scan_name}_vq.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
+
+
+    def visualize_occlusion_sensitivity(self, image, text_tokens, labels, scan_name, original_scan_path, patch_size=(20,40,40), stride=(10,20,20), use_text_embeds=False, prompt=""):
+        arithmetic_embeds = np.load(self.diff_embeds_folder, allow_pickle=True)
+        arithmetic_embeds = arithmetic_embeds.item()
+        tensor_embeds = {k: torch.tensor(v, dtype=torch.float32).to(self.accelerator.device).unsqueeze(0) for k, v in arithmetic_embeds.items()}
+
+        threshold = 0.5
         heatmaps = {}
 
-        for pos_pathology in positive_pathologies:
-            self.maybe_print("Processing pathology:", pos_pathology)
-            text_embeds = tensor_embeds[pos_pathology]
-            heatmap = np.zeros((D, H, W))
-            count_map = np.zeros((D, H, W))
+        if use_text_embeds:
+            positive_indices = (labels == 1).nonzero(as_tuple=True)[0]
+            positive_pathologies = [PATHOLOGIES[i] for i in positive_indices.tolist()]
+            for pos_pathology in positive_pathologies:
+                self.maybe_print("Processing pathology:", pos_pathology)
+                text_embeds = tensor_embeds[pos_pathology]
+                heatmap = self._compute_occlusion(image, text_tokens, text_embeds, patch_size, stride, threshold)
+                heatmaps[pos_pathology] = heatmap
 
-            # Compute original similarity score (before occlusion)
-            with torch.no_grad():
-                original_sim_matrix, *_ = self.model(None, image, text_embeds)
-                original_score = original_sim_matrix[self.rank, self.rank].item()
-
-            # Iterate through the assigned patch coordinates and occlude voxel windows
-            for idx, (d, h, w) in enumerate(patch_coords):
-                occluded_image = image.clone().detach()
-                occluded_image[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] = -1
-
-                occluded_sim_matrix, *_ = self.model(None, occluded_image, text_embeds)
-                occluded_score = occluded_sim_matrix[self.rank, self.rank].item()
-
-                importance = max(original_score - occluded_score, 0)
-                heatmap[d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] += importance
-                count_map[d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] += 1
-
-                if idx % 100 == 0 or idx == total_patches - 1:
-                    elapsed = time.time() - start_time
-                    avg_time_per_patch = elapsed / (idx + 1)
-                    remaining_time = avg_time_per_patch * (total_patches - (idx + 1))
-                    percent_done = 100.0 * (idx + 1) / total_patches
-
-                    print(f"[Rank {self.rank}] Patch {idx + 1}/{total_patches} "
-                        f"({percent_done:.2f}%) - Elapsed: {elapsed:.1f}s - ETA: {remaining_time:.1f}s")
-
-
-            heatmap_tensor = torch.tensor(heatmap, dtype=torch.float32, device=self.accelerator.device)
-            count_tensor = torch.tensor(count_map, dtype=torch.float32, device=self.accelerator.device)
-
-            if self.world_size > 1:
-                dist.reduce(heatmap_tensor, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(count_tensor, dst=0, op=dist.ReduceOp.SUM)
-
-            if self.accelerator.is_main_process:
-                count_tensor[count_tensor == 0] = 1
-                heatmap_tensor = heatmap_tensor / count_tensor
-                heatmap_tensor = (heatmap_tensor - heatmap_tensor.min()) / (heatmap_tensor.max() - heatmap_tensor.min() + 1e-8)
-
-                full_heatmap = heatmap_tensor.unsqueeze(0).unsqueeze(0)
-                full_heatmap = F.interpolate(full_heatmap,
-                                size=original_image.shape,
-                                mode='trilinear',
-                                align_corners=False).squeeze(0).squeeze(0)
-                full_heatmap = full_heatmap.detach().cpu().numpy()
-                full_heatmap[full_heatmap < threshold] = 0
-                full_heatmap = np.rot90(full_heatmap, k=-1, axes=(1, 2))
-                heatmaps[pos_pathology] = full_heatmap
+        else:
+            heatmap = self._compute_occlusion(image, text_tokens, None, patch_size, stride, threshold)
 
         if self.accelerator.is_main_process:
             extra_info = f"""
-                Text: embed diff
+                Text: {'Pathology Embeds' if use_text_embeds else 'Report'}
                 Threshold: {threshold}
                 Patch size: {patch_size}
                 Stride: {stride}
+                Prompt: {prompt if prompt else 'No prompt'}
             """
             results_dir = self._results_subdirectory("occlusion")
-            np.save(results_dir / f"{scan_name}_{str(patch_size)}_{str(stride)}_heatmaps.npy", heatmaps)
-            # self.visualize_overlay(original_image, full_heatmap, scan_name, "Occlusion", results_dir / f"{scan_name}.gif", extra_info=extra_info)
-            original_image = np.rot90(original_image, k=-1, axes=(1, 2))
-            self.visualize_pathology_heatmaps(original_image, heatmaps, results_dir / f"{scan_name}_{str(patch_size)}_{str(stride)}_occlusion.gif")
+            self.maybe_print("Created directory", str(results_dir))
+
+            if use_text_embeds:
+                np.save(results_dir / f"{scan_name}_{str(patch_size)}_{str(stride)}_{prompt}_heatmaps.npy", heatmaps)
+            
+            image = image.squeeze(0).squeeze(0)
+            image = image.cpu().numpy()
+            image = np.rot90(image, k=-1, axes=(1, 2))
+
+            if use_text_embeds:
+                for pathology, heatmap in heatmaps.items():
+                    self.maybe_print("Visualizing the heatmap overlay for pathology:", pathology)
+                    self.visualize_overlay(
+                        image,
+                        heatmap,
+                        scan_name=f"{scan_name}_{pathology}",
+                        overlay_name="Occlusion",
+                        save_path=results_dir / f"{scan_name}_{pathology}_{str(patch_size)}_{str(stride)}_occlusion.gif",
+                        extra_info=False,
+                        display_flags={"overlay": True}
+                    )
+            else:
+                self.maybe_print("Visualizing the heatmap overlay for prompt:", prompt)
+                self.visualize_overlay(image, heatmap, scan_name, "Occlusion", results_dir / f"{scan_name}_{prompt}.gif", extra_info=False, display_flags={"overlay": True})
 
 
     def visualize(self, **kwargs):
@@ -531,36 +981,96 @@ class Visualizations():
                 continue
 
             if self.world_size > 1:
-                torch.distributed.barrier()  # Ensure all processes are at the same point
-            
-            if name == "attention":
+                torch.distributed.barrier()
+
+            if name in ["raw_attention_maps", "attention_rollout", "integrated_gradients", "grad_cam"]:
                 dataloader = self.dist_dataloader
-                visual_func = self.visualize_integrated_gradients
-            elif name == "grad_cam":
-                dataloader = self.dist_dataloader
-                visual_func = self.visualize_grad_cam
+
+                if name == "raw_attention_maps":
+                    visual_func = self.visualize_raw_attention_maps
+                elif name == "attention_rollout":
+                    visual_func = self.visualize_attention_rollout
+                elif name == "integrated_gradients":
+                    visual_func = self.visualize_integrated_gradients
+                elif name == "grad_cam":
+                    visual_func = self.visualize_grad_cam
+
+                self.maybe_print(f"{name} visualization started.")
+                start_time = time.time()
+
+                for batch in dataloader:
+                    image, texts, labels, scan_names, original_scan_paths = [
+                        b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch
+                    ]
+                    text_tokens = self.tokenizer(
+                        texts,
+                        return_tensors="pt",
+                        padding="max_length",
+                        truncation=True,
+                        max_length=512
+                    ).to(self.accelerator.device)
+
+                    self.model.zero_grad()
+                    visual_func(image, text_tokens, labels[0], scan_names[0], original_scan_paths[0])
+
             elif name == "occlusion":
-                dataloader = self.single_dataloader
                 visual_func = self.visualize_occlusion_sensitivity
+                self.maybe_print("Occlusion visualization started.")
+                start_time = time.time()
+
+                if self.rank == 0:
+                    pbar = tqdm(total=len(self.dataset), desc="Occlusion", unit="sample", mininterval=10.0)
+                else:
+                    pbar = None
+
+                for idx in range(len(self.dataset)):
+                    # Load on rank 0, broadcast to all others
+                    if self.rank == 0:
+                        sample = self.dataset[idx]
+                    else:
+                        sample = None
+
+                    if self.world_size > 1:
+                        sample = self._broadcast_sample(sample)
+                    else:
+                        sample = [x.unsqueeze(0).to(self.accelerator.device) if isinstance(x, torch.Tensor) else [x] for x in sample]
+
+                    image, texts, labels, scan_names, original_scan_paths = [
+                        b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in sample
+                    ]
+
+                    text_tokens = self.tokenizer(
+                        texts,
+                        return_tensors="pt",
+                        padding="max_length",
+                        truncation=True,
+                        max_length=512
+                    ).to(self.accelerator.device)
+
+                    self.model.zero_grad()
+
+                    # for text_prompt in SEGMENTABLE_TERMS:
+                    #     self.maybe_print("Text prompt:", text_prompt)
+                    #     text_tokens = self.tokenizer(
+                    #         text_prompt,
+                    #         return_tensors="pt",
+                    #         padding="max_length",
+                    #         truncation=True,
+                    #         max_length=512
+                    #     ).to(self.accelerator.device)
+                    #     visual_func(image, text_tokens, labels[0], scan_names[0], original_scan_paths[0], prompt=text_prompt)
+
+                    visual_func(image, text_tokens, labels[0], scan_names[0], original_scan_paths[0], use_text_embeds=True)
+
+                    if pbar is not None:
+                        pbar.update(1)
+
+                if pbar is not None:
+                    pbar.close()
+
             else:
-                self.maybe_print(f"{name} is not correct visualization argument, returning.")
+                self.maybe_print(f"{name} is not a valid visualization argument.")
                 return
 
-            start_time = time.time()
-            self.maybe_print(f"{name} visualization started.")
-
-            for batch in iter(dataloader):
-                image, texts, labels, scan_names, original_scan_paths = [b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch]
-                text_tokens = self.tokenizer(
-                    texts,
-                    return_tensors="pt",
-                    padding="max_length",
-                    truncation=True,
-                    max_length=512
-                ).to(self.accelerator.device)
-
-                self.model.zero_grad()
-                visual_func(image, text_tokens, labels[0], scan_names[0], original_scan_paths[0])
-
             total_time = time.time() - start_time
-            self.maybe_print(f"{name} visualization completed. Total visualization time: {str(timedelta(seconds=total_time))}")
+            self.maybe_print(f"{name} visualization completed. Time: {str(timedelta(seconds=total_time))}")

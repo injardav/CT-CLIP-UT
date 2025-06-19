@@ -318,8 +318,6 @@ class Transformer(nn.Module):
         self_attn_mask = None,
         cross_attn_context_mask = None
     ):
-        self_attention_weights = []
-        cross_attention_weights = []
 
         for peg, self_attn, cross_attn, ff in self.layers:
             if exists(peg):
@@ -327,15 +325,11 @@ class Transformer(nn.Module):
 
             x_out, self_weights = self_attn(x, attn_bias = attn_bias, mask = self_attn_mask)
             x = x_out + x
-            self_attention_weights.append(self_weights)
 
             if exists(cross_attn) and exists(context):
                 x_out, cross_weights = cross_attn(x, context = context, mask = cross_attn_context_mask)
                 x = x_out + x
-                cross_attention_weights.append(cross_weights)
-            else:
-                cross_attention_weights.append(None)
 
             x = ff(x) + x
         
-        return self.norm_out(x), self_attention_weights, cross_attention_weights
+        return self.norm_out(x)

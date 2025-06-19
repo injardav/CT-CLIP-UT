@@ -107,7 +107,7 @@ class CTCLIP(nn.Module):
         text_output = self.text_transformer(**text_inputs).last_hidden_state[:, 0, :] if text_inputs else text_embeds
 
         # vit encoder approach
-        image_tokens, spatial_attention_weights, temporal_attention_weights = self.visual_transformer(image_inputs)
+        image_tokens = self.visual_transformer(image_inputs)
         image_output = image_tokens.mean(dim=1)
         image_output = image_output.view(image_output.shape[0], -1)
 
@@ -126,4 +126,4 @@ class CTCLIP(nn.Module):
         # --- Similarity Matrix ---
         sim_matrix = image_latents @ text_latents.t() * self.temperature.exp()
 
-        return sim_matrix, image_latents, text_latents, self.temperature.exp(), image_tokens, spatial_attention_weights, temporal_attention_weights
+        return sim_matrix, image_latents, text_latents, self.temperature.exp(), image_tokens

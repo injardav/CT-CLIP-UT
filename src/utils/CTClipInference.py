@@ -32,27 +32,6 @@ PATHOLOGIES = [
         ]
 
 
-class SingleSampleDistributedSampler(Sampler):
-    """
-    Forces all GPUs in Distributed Data Parallel (DDP) to receive the same sample.
-    Useful when multiple GPU's need to be used on a computationally expensive task.
-    """
-    def __init__(self, dataset, sample_index=0, num_replicas=None, rank=None):
-        self.sample_index = sample_index  # The single index to be used on all GPUs
-        if torch.distributed.is_initialized():
-            self.num_replicas = num_replicas or torch.distributed.get_world_size()
-            self.rank = rank or torch.distributed.get_rank()
-        else:
-            self.num_replicas = 1
-            self.rank = 0
-
-    def __iter__(self):
-        return iter([self.sample_index])  # Return only one index for all processes
-
-    def __len__(self):
-        return 1  # Only one sample is being used   
-
-
 class CTClipInference(nn.Module):
     """
     CTClipInference for evaluation of CLIP model.
@@ -96,13 +75,6 @@ class CTClipInference(nn.Module):
         self.num_valid_samples = num_valid_samples if num_valid_samples else (1 if not torch.distributed.is_initialized() else torch.distributed.get_world_size())
         self.batch_size = batch_size
         self.ds = InferenceDataset(data_folder=data_valid, reports=valid_reports, metadata=valid_metadata, labels=valid_labels, num_samples=self.num_valid_samples)
-        
-        self.single_dist_sampler = SingleSampleDistributedSampler(
-            self.ds, 
-            sample_index=0,
-            num_replicas=self.world_size,
-            rank=self.rank
-        )
 
         if self.world_size > 1:
             self.sampler = DistributedSampler(
@@ -115,7 +87,6 @@ class CTClipInference(nn.Module):
         else:
             self.sampler = RandomSampler(self.ds)
 
-        self.single_dist_dl = DataLoader(self.ds, batch_size=batch_size, sampler=self.single_dist_sampler, num_workers=num_workers)
         self.dl = DataLoader(self.ds, batch_size=batch_size, sampler=self.sampler, num_workers=num_workers)
 
         (
@@ -140,7 +111,7 @@ class CTClipInference(nn.Module):
         self.vis = Visualizations(
             self.model,
             self.accelerator,
-            self.single_dist_dl,
+            self.ds,
             self.dl,
             self.batch_size,
             self.results_folder,
@@ -241,7 +212,9 @@ class CTClipInference(nn.Module):
 
         if self.visualize:
             self.vis.visualize(
-                attention=False,
+                raw_attention_maps=False,
+                attention_rollout=False,
+                integrated_gradients=False,
                 grad_cam=False,
                 occlusion=True
             )

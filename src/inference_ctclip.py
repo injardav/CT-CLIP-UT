@@ -51,7 +51,7 @@ inference = CTClipInference(
     tokenizer = tokenizer,
     batch_size = 1,
     num_workers = 4,
-    num_valid_samples = 1,
+    num_valid_samples = 5,
     zero_shot = False,
     visualize = True
 )

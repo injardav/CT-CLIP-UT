@@ -172,13 +172,14 @@ class Attention(nn.Module):
             sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         attn = sim.softmax(dim = -1)
+        attn_without_dropout = attn
         attn = self.attn_dropout(attn)
 
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
 
         out = rearrange(out, 'b h n d -> b n (h d)')
 
-        return self.to_out(out), attn
+        return self.to_out(out), attn_without_dropout
 
 # alibi positional bias for extrapolation
 

@@ -185,6 +185,38 @@ class Visualizations():
 
         feature_map.register_hook(save_grad)
 
+
+    def _save_spatial_ff_outputs(self, module, input, output):
+        """
+        Hook for spatial FeedForward layer. Captures:
+        - Feature map
+        - Gradients of the feature map
+        """
+        feature_map = output  # output is a single tensor from nn.Sequential
+
+        self.saved_outputs["spatial_ff_features"].append(feature_map.detach())
+
+        def save_grad(grad):
+            self.saved_outputs["spatial_ff_gradients"].append(grad)
+
+        feature_map.register_hook(save_grad)
+
+
+    def _save_temporal_ff_outputs(self, module, input, output):
+        """
+        Hook for spatial FeedForward layer. Captures:
+        - Feature map
+        - Gradients of the feature map
+        """
+        feature_map = output  # output is a single tensor from nn.Sequential
+
+        self.saved_outputs["temporal_ff_features"].append(feature_map.detach())
+
+        def save_grad(grad):
+            self.saved_outputs["temporal_ff_gradients"].append(grad)
+
+        feature_map.register_hook(save_grad)
+
     
     def _register_hooks(self):
         """
@@ -201,6 +233,10 @@ class Visualizations():
         self.saved_outputs["vq_gradients"] = []
         self.saved_outputs["spatial_gradients"] = []
         self.saved_outputs["temporal_gradients"] = []
+        self.saved_outputs["spatial_ff_features"] = []
+        self.saved_outputs["spatial_ff_gradients"] = []
+        self.saved_outputs["temporal_ff_features"] = []
+        self.saved_outputs["temporal_ff_gradients"] = []
 
         # VQ features and gradients
         vq_layer = self.model.visual_transformer.vq
@@ -215,6 +251,16 @@ class Visualizations():
         for layer in self.model.visual_transformer.enc_temporal_transformer.layers:
             attn_module = layer[1]
             self.hooks.append(attn_module.register_forward_hook(self._save_temporal_layer_outputs))
+
+        # Register hooks for all spatial feedforward layers
+        for layer in self.model.visual_transformer.enc_spatial_transformer.layers:
+            ff_module = layer[3]
+            self.hooks.append(ff_module.register_forward_hook(self._save_spatial_ff_outputs))
+
+        # Register hooks for all temporal feedforward layers
+        for layer in self.model.visual_transformer.enc_temporal_transformer.layers:
+            ff_module = layer[3]
+            self.hooks.append(ff_module.register_forward_hook(self._save_temporal_ff_outputs))
 
 
     def _remove_hooks(self):
@@ -614,16 +660,14 @@ class Visualizations():
         for layer_idx, attn in enumerate(attention_weights_list):  # loop over layers
             for head in range(num_heads):
                 if mode == 'spatial':
-                    # attn: [D, H, Q, K] → [D, Q, K]
-                    received = attn[:, head].sum(dim=1)  # sum over queries → [D, K]
+                    # attn: [D, H, hw, hw] → [D, hw, hw]
+                    received = attn[:, head].mean(dim=1)  # sum over hw → [D, hw]
                     vol = received.view(D, H, W)  # [D, 24, 24]
                 elif mode == 'temporal':
-                    vol = torch.zeros((24, 24, 24), device=attn.device)  # [D, H, W]
-                    for i in range(576):
-                        h_idx = i // 24
-                        w_idx = i % 24
-                        received = attn[i, head].sum(dim=0)  # [24]
-                        vol[:, h_idx, w_idx] = received  # OK: [24] assigned into [:, h, w]
+                    # attn: [HW, H, D, D] → [HW, D, D]
+                    received = attn[:, head].mean(dim=1)  # sum over D → [576, 24]
+                    vol = received.view(H, W, D)  # [24, 24, 24]
+                    vol = torch.permute(vol, (2, 0, 1))
 
                 vol = (vol - vol.min()) / (vol.max() + 1e-8)
                 vol = vol.cpu().numpy()
@@ -786,10 +830,12 @@ class Visualizations():
             )
             temporal_rollouts.append(rollout.sum(dim=0))  # [24] token importance over time
 
-        temporal_avg = torch.stack(temporal_rollouts).mean(dim=0)  # [24]
-        temporal_vol = np.stack([np.full((24, 24), v.item()) for v in temporal_avg], axis=0)
+        temporal_vol = torch.stack(temporal_rollouts)  # [576, 24]
+        temporal_vol = temporal_vol.view(H, W, D)  # [24, 24, 24]
+        temporal_vol = torch.permute(temporal_vol, (2, 0, 1))
+
         temporal_vol = (temporal_vol - temporal_vol.min()) / (temporal_vol.max() - temporal_vol.min() + 1e-8)
-        temporal_vol = self._upsample(torch.from_numpy(temporal_vol), image.shape)
+        temporal_vol = self._upsample(temporal_vol, image.shape)
         temporal_vol = np.rot90(temporal_vol, k=-1, axes=(1, 2))
         
         if self.accelerator.is_main_process:
@@ -799,8 +845,8 @@ class Visualizations():
 
     def visualize_integrated_gradients(self, image, text_tokens, labels, scan_name, original_scan_path, steps=50):
         # Prepare baseline image
-        baseline_value = -1
-        baseline = torch.zeros_like(image) * baseline_value
+        baseline_value = 1
+        baseline = torch.ones_like(image) * baseline_value
         baseline = baseline.to(self.accelerator.device)
 
         grads = []
@@ -869,9 +915,38 @@ class Visualizations():
             sim_matrix[self.rank, self.rank].backward()
         self._remove_hooks()
 
+
+        # FF ----------------------------- FF #
+
+
+        # Extract ff feature maps and gradients
+        spatial_ff_features = self.saved_outputs.get("spatial_ff_features")[-1]                     # torch.Size([24, 576, 512])
+        temporal_ff_features = self.saved_outputs.get("temporal_ff_features")[-1]                   # torch.Size([576, 24, 512])
+
+        # Average over spatial tokens to get averaged weights
+        spatial_ff_gradients = self.saved_outputs.get("spatial_ff_gradients")[-1].mean(dim=(0, 1))   # torch.Size([24, 576, 512]) --> torch.Size([512])
+        temporal_ff_gradients = self.saved_outputs.get("temporal_ff_gradients")[-1].mean(dim=(0, 1)) # torch.Size([576, 24, 512]) --> torch.Size([512])
+
+        # Compute ff CAMs
+        spatial_ff_cam = (spatial_ff_features * spatial_ff_gradients.view(1, 1, -1)).sum(dim=-1).relu()
+        temporal_ff_cam = (temporal_ff_features * temporal_ff_gradients.view(1, 1, -1)).sum(dim=-1).relu()
+
+        # Reshape flattened ff spatial/temporal CAMs to 3D volumes
+        spatial_ff_cam = spatial_ff_cam.view(24, 24, 24)
+        temporal_ff_cam = temporal_ff_cam.view(24, 24, 24)
+        temporal_ff_cam = torch.permute(temporal_ff_cam, (2, 0, 1))
+
+        # Normalize ff CAMs
+        spatial_ff_cam = (spatial_ff_cam - spatial_ff_cam.min()) / (spatial_ff_cam.max() + 1e-8)
+        temporal_ff_cam = (temporal_ff_cam - temporal_ff_cam.min()) / (temporal_ff_cam.max() + 1e-8)
+
+
+        # SELF-ATTN ----------------------------- SELF-ATTN #
+
+
         # Extract feature maps and gradients in [T, H*W, D] shape
         spatial_features = self.saved_outputs.get("spatial_features")[-1]                           # torch.Size([24, 576, 512])
-        temporal_features = self.saved_outputs.get("temporal_features")[-1]                         # torch.Size([24, 576, 512])
+        temporal_features = self.saved_outputs.get("temporal_features")[-1]                         # torch.Size([576, 24, 512])
 
         # Average over the embedding dimension to get weights
         spatial_gradients = self.saved_outputs.get("spatial_gradients")[-1].mean(dim=(0, 1))         # torch.Size([512])
@@ -884,6 +959,7 @@ class Visualizations():
         # Reshape flattened spatial CAMs to 3D volumes
         spatial_cam = spatial_cam.view(24, 24, 24)
         temporal_cam = temporal_cam.view(24, 24, 24)
+        temporal_cam = torch.permute(temporal_cam, (2, 0, 1))
 
         # Normalize
         spatial_cam = (spatial_cam - spatial_cam.min()) / (spatial_cam.max() + 1e-8)
@@ -911,20 +987,26 @@ class Visualizations():
         # Upsample CAMs
         image = image.squeeze().cpu()
         spatial_cam_np = self._upsample(spatial_cam, image.shape)
+        spatial_ff_cam_np = self._upsample(spatial_ff_cam, image.shape)
         temporal_cam_np = self._upsample(temporal_cam, image.shape)
+        temporal_ff_cam_np = self._upsample(temporal_ff_cam, image.shape)
         combined_cam_np = self._upsample(combined_cam, image.shape)
         vq_cam_np = self._upsample(vq_cam, image.shape)
 
         # Rotate 90 degrees so CT table is down
         image = np.rot90(image, k=-1, axes=(1, 2))
         spatial_cam_np = np.rot90(spatial_cam_np, k=-1, axes=(1, 2))
+        spatial_ff_cam_np = np.rot90(spatial_ff_cam_np, k=-1, axes=(1, 2))
         temporal_cam_np = np.rot90(temporal_cam_np, k=-1, axes=(1, 2))
+        temporal_ff_cam_np = np.rot90(temporal_ff_cam_np, k=-1, axes=(1, 2))
         combined_cam_np = np.rot90(combined_cam_np, k=-1, axes=(1, 2))
         vq_cam_np = np.rot90(vq_cam_np, k=-1, axes=(1, 2))
 
         if self.accelerator.is_main_process:
             results_dir = self._results_subdirectory("grad_cam")
-            extra_info = "Text: original\nThreshold: 0.0\nBackprop: rank sim score"
+            extra_info = f"Similarity score: {sim_matrix.item()}"
+            self.visualize_overlay(image, spatial_ff_cam_np, scan_name, "Grad-CAM (Spatial FeedForward)", results_dir / f"{scan_name}_spatial_ff.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
+            self.visualize_overlay(image, temporal_ff_cam_np, scan_name, "Grad-CAM (Temporal FeedForward)", results_dir / f"{scan_name}_temporal_ff.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
             self.visualize_overlay(image, spatial_cam_np, scan_name, "Grad-CAM (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
             self.visualize_overlay(image, temporal_cam_np, scan_name, "Grad-CAM (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
             self.visualize_overlay(image, combined_cam_np, scan_name, "Grad-CAM (Combined)", results_dir / f"{scan_name}_combined.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
@@ -936,7 +1018,7 @@ class Visualizations():
         arithmetic_embeds = arithmetic_embeds.item()
         tensor_embeds = {k: torch.tensor(v, dtype=torch.float32).to(self.accelerator.device).unsqueeze(0) for k, v in arithmetic_embeds.items()}
 
-        threshold = 0.5
+        threshold = 0.0
         heatmaps = {}
 
         if use_text_embeds:
@@ -1016,8 +1098,12 @@ class Visualizations():
                     image, texts, labels, scan_names, original_scan_paths = [
                         b.to(self.accelerator.device) if isinstance(b, torch.Tensor) else b for b in batch
                     ]
+
+                    custom_prompt1 = "Ground-glass densities and bilateral minimal pleural effusion evaluated in favor of viral pneumonia in both lungs"
+                    custom_prompt2 = "viral pneumonia"
                     text_tokens = self.tokenizer(
                         texts,
+                        # custom_prompt2,
                         return_tensors="pt",
                         padding="max_length",
                         truncation=True,
@@ -1025,7 +1111,8 @@ class Visualizations():
                     ).to(self.accelerator.device)
 
                     self.model.zero_grad()
-                    visual_func(image, text_tokens, labels[0], scan_names[0], original_scan_paths[0])
+                    black_box = torch.ones_like(image) * -1
+                    visual_func(black_box, text_tokens, labels[0], scan_names[0], original_scan_paths[0])
 
             elif name == "occlusion":
                 visual_func = self.visualize_occlusion_sensitivity
@@ -1074,7 +1161,7 @@ class Visualizations():
                     #     ).to(self.accelerator.device)
                     #     visual_func(image, text_tokens, labels[0], scan_names[0], original_scan_paths[0], prompt=text_prompt)
 
-                    visual_func(image, text_tokens, labels[0], scan_names[0], original_scan_paths[0], use_text_embeds=True)
+                    visual_func(image, text_tokens, labels[0], scan_names[0], original_scan_paths[0], use_text_embeds=False)
 
                     if pbar is not None:
                         pbar.update(1)

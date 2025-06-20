@@ -215,8 +215,8 @@ class CTClipInference(nn.Module):
                 raw_attention_maps=False,
                 attention_rollout=False,
                 integrated_gradients=False,
-                grad_cam=True,
-                occlusion=False
+                grad_cam=False,
+                occlusion=True
             )
             
         total_time = time.time() - start_time

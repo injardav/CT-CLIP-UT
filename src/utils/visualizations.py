@@ -634,7 +634,9 @@ class Visualizations():
             results_dir = self._results_subdirectory("raw_attention_maps")
             self.visualize_overlay(image, spatial_attention_map, scan_name, "Raw Attention Map (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0, display_flags={"heatmap": True, "overlay": True})
             self.visualize_overlay(image, temporal_attention_map, scan_name, "Raw Attention Map (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0, display_flags={"heatmap": True, "overlay": True})
-    
+
+            np.save(results_dir / f"{scan_name}_spatial.npy", spatial_attention_map)
+            np.save(results_dir / f"{scan_name}_temporal.npy", temporal_attention_map)
     
     def visualize_attention_grid_gif(self, attention_weights_list, scan_name, save_path, H=24, W=24, tokens_dim='key', mode='spatial'):
         """
@@ -843,6 +845,9 @@ class Visualizations():
             self.visualize_overlay(image, volume, scan_name, "Attention Rollout (Spatial)", results_dir / f"{scan_name}_spatial.gif", threshold=0.0)
             self.visualize_overlay(image, temporal_vol, scan_name, "Attention Rollout (Temporal)", results_dir / f"{scan_name}_temporal.gif", threshold=0.0)
 
+            np.save(results_dir / f"{scan_name}_spatial.npy", volume)
+            np.save(results_dir / f"{scan_name}_temporal.npy", temporal_vol)
+
     def visualize_integrated_gradients(self, image, text_tokens, labels, scan_name, original_scan_path, steps=50):
         # Prepare baseline image
         baseline_value = 1
@@ -898,6 +903,7 @@ class Visualizations():
         if self.accelerator.is_main_process:
             results_dir = self._results_subdirectory("integrated_gradients")
             self.visualize_overlay(image, ig, scan_name, f"Integrated Gradients ({baseline_value})", results_dir / f"{scan_name}.gif", threshold=0.0)
+            np.save(results_dir / f"{scan_name}.npy", ig)
         
         del grads, avg_grads, diff, sim_matrix, loss, baseline
         torch.cuda.empty_cache()
@@ -1012,6 +1018,13 @@ class Visualizations():
             self.visualize_overlay(image, combined_cam_np, scan_name, "Grad-CAM (Combined)", results_dir / f"{scan_name}_combined.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
             self.visualize_overlay(image, vq_cam_np, scan_name, "Grad-CAM (VQ)", results_dir / f"{scan_name}_vq.gif", threshold=0.0, extra_info=extra_info, display_flags={"overlay": True})
 
+            np.save(results_dir / f"{scan_name}_spatial_ff.npy", spatial_ff_cam_np)
+            np.save(results_dir / f"{scan_name}_temporal_ff.npy", temporal_ff_cam_np)
+            np.save(results_dir / f"{scan_name}_spatial.npy", spatial_cam_np)
+            np.save(results_dir / f"{scan_name}_temporal.npy", temporal_cam_np)
+            np.save(results_dir / f"{scan_name}_combined.npy", combined_cam_np)
+            np.save(results_dir / f"{scan_name}_vq.npy", vq_cam_np)
+
 
     def visualize_occlusion_sensitivity(self, image, text_tokens, labels, scan_name, original_scan_path, patch_size=(20,40,40), stride=(10,20,20), use_text_embeds=False, prompt=""):
         arithmetic_embeds = np.load(self.diff_embeds_folder, allow_pickle=True)
@@ -1066,6 +1079,7 @@ class Visualizations():
             else:
                 self.maybe_print("Visualizing the heatmap overlay for prompt:", prompt)
                 self.visualize_overlay(image, heatmap, scan_name, "Occlusion", results_dir / f"{scan_name}_{prompt}.gif", extra_info=False, display_flags={"overlay": True})
+                np.save(results_dir / f"{scan_name}_{prompt}_heatmap.npy", heatmap)
 
 
     def visualize(self, **kwargs):

@@ -1111,8 +1111,8 @@ class Visualizations():
                     ).to(self.accelerator.device)
 
                     self.model.zero_grad()
-                    black_box = torch.ones_like(image) * -1
-                    visual_func(black_box, text_tokens, labels[0], scan_names[0], original_scan_paths[0])
+                    # black_box = torch.ones_like(image) * -1
+                    visual_func(image, text_tokens, labels[0], scan_names[0], original_scan_paths[0])
 
             elif name == "occlusion":
                 visual_func = self.visualize_occlusion_sensitivity

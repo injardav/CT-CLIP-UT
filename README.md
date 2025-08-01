@@ -16,4 +16,4 @@ This work focuses on evaluating the interpretability and spatial localization ca
 
 The following visualizations demonstrate the model’s response under different attribution techniques.
 
-![Attribution Visualization Results](image.png)
+![Attribution Visualization Results](results/mega_figure.png)
